@@ -15,7 +15,7 @@
 
 import type { CoreDeps, UpstreamAdapter, UpstreamInstanceConfig } from "./adapter"
 import { ApiKeyState, type BucketSpec } from "./bucket"
-import { buildCostResolver, type CostResolver, type CostTable } from "./cost"
+import { buildLayeredCostResolver, type CostResolver, type CostTable } from "./cost"
 import type { CapabilityErrorMatcher } from "./capsig"
 import { postJson, type PostJsonOptions } from "./http"
 import { classifyBody, classifyResponse, verdictToEntry, type ItemVerdict } from "./result"
@@ -148,9 +148,15 @@ export class ApikeyPool {
     return this.sickUntilMs
   }
 
+  /**
+   * Cost of one item. A cost of 0 is legitimate — Alchemy bills 0 CU for
+   * `eth_chainId`/`net_version`/… — so only a missing or unusable number falls
+   * back to 1. `buildLayeredCostResolver` already guarantees a number, this is
+   * just belt-and-braces against a custom `costFor`.
+   */
   private itemCost(method: string): number {
     const cost = this.options.costFor(method)
-    return Number.isFinite(cost) && cost > 0 ? cost : 1
+    return Number.isFinite(cost) && cost >= 0 ? cost : 1
   }
 
   /**
@@ -469,10 +475,12 @@ export const buildBody = (group: Group): unknown => {
 
 export type AdapterHooks = {
   matchCapability?: CapabilityErrorMatcher
-  /** Provider cost override (wins over cfg.costs only if cfg has none). */
+  /**
+   * Provider default cost table. It is the OUTERMOST layer: an instance's config
+   * `costs:` overrides it (design.md §15 "CU asli (override)"), and only then do
+   * the global `defaults.costs` apply (design.md §5.3).
+   */
   costs?: CostTable
-  /** Global default cost table (design.md §5.3 middle layer). */
-  globalCosts?: CostTable
   headers?(token: string): Record<string, string>
   countsBatchAsOne?: boolean
   observer?: PoolObserver
@@ -489,7 +497,8 @@ export const createPoolAdapter = (
   deps: CoreDeps,
   hooks: AdapterHooks = {},
 ): UpstreamAdapter => {
-  const costFor = buildCostResolver(hooks.costs ?? cfg.costs, hooks.globalCosts)
+  // design.md §5.3: instance override ?? provider default ?? global default ?? 1.
+  const costFor = buildLayeredCostResolver([cfg.costs, hooks.costs, deps.globalCosts])
   const countsBatchAsOne =
     cfg.counts_batch_as_one_request ?? hooks.countsBatchAsOne ?? false
 

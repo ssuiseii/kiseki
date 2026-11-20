@@ -46,7 +46,7 @@ export {
 } from "./capsig"
 
 export type { CostResolver, CostTable } from "./cost"
-export { buildCostResolver, lookupCost } from "./cost"
+export { buildCostResolver, buildLayeredCostResolver, lookupCost } from "./cost"
 
 export type { PostJsonFailure, PostJsonOk, PostJsonOptions, PostJsonResult } from "./http"
 export { postJson } from "./http"

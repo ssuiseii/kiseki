@@ -43,6 +43,32 @@ export const lookupCost = (table: CostTable | undefined, method: string): number
 
 export type CostResolver = (method: string) => number
 
+const toTable = (table: CostTable | undefined): CostTable | undefined => {
+  const entries = normalize(table)
+  return entries.length === 0 ? undefined : Object.fromEntries(entries)
+}
+
+/**
+ * Resolve a method against ordered layers: the first layer that knows the method
+ * wins, and only when no layer does does the implicit cost of 1 apply.
+ *
+ * Layers are tried whole, not per key. That matters for the precedence rules in
+ * design.md §5.3: an instance override of `trace_*` must beat a provider default
+ * of `trace_block`, which a plain map merge (exact beats prefix) would invert.
+ */
+export const buildLayeredCostResolver = (
+  layers: readonly (CostTable | undefined)[],
+): CostResolver => {
+  const tables = layers.map(toTable)
+  return (method: string): number => {
+    for (const table of tables) {
+      const cost = lookupCost(table, method)
+      if (cost !== undefined) return cost
+    }
+    return 1
+  }
+}
+
 /**
  * Build the effective resolver for one upstream instance. Provider overrides are
  * checked first, then the global defaults, then the implicit cost of 1.
@@ -50,12 +76,4 @@ export type CostResolver = (method: string) => number
 export const buildCostResolver = (
   providerCosts: CostTable | undefined,
   globalCosts: CostTable | undefined,
-): CostResolver => {
-  const provider = normalize(providerCosts)
-  const global = normalize(globalCosts)
-  const providerTable = provider.length === 0 ? undefined : Object.fromEntries(provider)
-  const globalTable = global.length === 0 ? undefined : Object.fromEntries(global)
-
-  return (method: string): number =>
-    lookupCost(providerTable, method) ?? lookupCost(globalTable, method) ?? 1
-}
+): CostResolver => buildLayeredCostResolver([providerCosts, globalCosts])

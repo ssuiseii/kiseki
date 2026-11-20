@@ -839,10 +839,63 @@ describe("createPoolAdapter", () => {
     const { fetchImpl } = makeFetch([{ kind: "json", body: okResult(0, "0x1") }])
     const adapter = createPoolAdapter(
       cfg,
-      { bucketRegistry: registry, logger: silentLogger, now: clock.now, fetchImpl },
-      { costs: { eth_blockNumber: 7 }, globalCosts: { eth_blockNumber: 1 } },
+      {
+        bucketRegistry: registry,
+        logger: silentLogger,
+        now: clock.now,
+        fetchImpl,
+        globalCosts: { eth_blockNumber: 1 },
+      },
+      { costs: { eth_blockNumber: 7 } },
     )
     await adapter.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
     expect(registry.peek("alchemy", "KEY_A")!.credits(0)).toEqual([93])
+  })
+
+  test("instance costs: override the provider default (design.md §5.3, §15)", async () => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl } = makeFetch([{ kind: "json", body: okResult(0, "0x1") }])
+    const adapter = createPoolAdapter(
+      { ...cfg, costs: { eth_blockNumber: 3 } },
+      { bucketRegistry: registry, logger: silentLogger, now: clock.now, fetchImpl },
+      { costs: { eth_blockNumber: 7 } },
+    )
+    await adapter.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(registry.peek("alchemy", "KEY_A")!.credits(0)).toEqual([97])
+  })
+
+  test("a whole layer wins over a more specific key in a lower layer", async () => {
+    // design.md §5.3: override_provider[method] ?? default_global[prefix]. An
+    // instance override of `trace_*` must beat a provider default of the exact
+    // `trace_block`, not be outranked by exact-match-wins within a merged map.
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl } = makeFetch([{ kind: "json", body: okResult(0, "0x1") }])
+    const adapter = createPoolAdapter(
+      { ...cfg, costs: { "trace_*": 2 } },
+      { bucketRegistry: registry, logger: silentLogger, now: clock.now, fetchImpl },
+      { costs: { trace_block: 9 } },
+    )
+    await adapter.attempt(group([groupItem(0, "trace_block")]), ctx(clock.now))
+    expect(registry.peek("alchemy", "KEY_A")!.credits(0)).toEqual([98])
+  })
+
+  test("global defaults apply when neither the instance nor the provider knows the method", async () => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl } = makeFetch([{ kind: "json", body: okResult(0, "0x1") }])
+    const adapter = createPoolAdapter(
+      cfg,
+      {
+        bucketRegistry: registry,
+        logger: silentLogger,
+        now: clock.now,
+        fetchImpl,
+        globalCosts: { "eth_*": 4 },
+      },
+    )
+    await adapter.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(registry.peek("alchemy", "KEY_A")!.credits(0)).toEqual([96])
   })
 })

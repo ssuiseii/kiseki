@@ -1,0 +1,88 @@
+# kiseki.yaml — example deployment config (design.md §15).
+#
+# Every value here is a starting point, not a recommendation: buckets must be
+# filled from the real limits of YOUR apikeys (design.md Lampiran B).
+#
+# Secrets come from the environment via ${VAR}. A missing variable is a startup
+# error (design.md §15.1 rule 4) — the process refuses to run with an empty key
+# rather than silently sending anonymous requests.
+#
+#   ${VAR}              required; startup error if unset or empty
+#   ${VAR:-fallback}    use `fallback` when unset or empty
+#   ${VAR?why it matters}  required, with a custom error message
+#
+# A substituted value is inserted verbatim, so a token containing `:` or `#`
+# must be quoted in this file, e.g. token: "${ALCHEMY_KEY_A}".
+
+server:
+  port: 8545
+  host: "127.0.0.1"
+  auth:
+    methods: ["path", "bearer"]
+    keys:
+      - { token: "${KISEKI_KEY_MAIN}", label: main }
+      - { token: "${KISEKI_KEY_INDEXER}", label: indexer }
+
+defaults:
+  costs:
+    "eth_call": 1
+    "eth_getLogs": 2
+    "trace_*": 5
+    "debug_*": 5
+    "replay_*": 10
+  timeouts:
+    default_seconds: 30
+    heavy_seconds: 120
+    heavy_methods: ["trace_*", "debug_*", "replay_*"]
+  blocked_methods: ["eth_sendTransaction"]
+
+chains:
+  ethereum:
+    upstreams:
+      - name: alchemy-ethereum           # instance = provider + chain
+        provider: alchemy                # identity used for bucket sharing (§5.4)
+        package: alchemy                 # adapter package; "generic" = fallback
+        url_template: "https://eth-mainnet.g.alchemy.com/v2/{apikey}"
+        apikeys:
+          - { token: "${ALCHEMY_KEY_A}", label: a,
+              buckets: [{ capacity: 330, refill_per_second: 330 }] }
+          - { token: "${ALCHEMY_KEY_B}", label: b,
+              buckets: [{ capacity: 330, refill_per_second: 330 }] }
+        methods: ["eth_*", "trace_*", "debug_*", "replay_*"]
+        archive: true
+        costs: { "eth_call": 2, "trace_block": 5 }   # override over the CU table
+        counts_batch_as_one_request: false
+
+      - name: ankr-ethereum
+        provider: ankr
+        package: generic                 # no provider package needed
+        url_template: "https://rpc.ankr.com/eth/{apikey}"
+        apikeys:
+          # Two buckets = two limit dimensions (RPS and RPM), both deducted
+          # together with the same cost (design.md §5.2).
+          - token: "${ANKR_KEY}"
+            label: main
+            buckets:
+              - { capacity: 15,  refill_per_second: 15 }    # RPS
+              - { capacity: 600, refill_per_second: 10 }    # RPM
+        methods: ["eth_*"]
+        archive: false
+
+  base:
+    upstreams:
+      - name: alchemy-base
+        provider: alchemy
+        package: alchemy
+        url_template: "https://base-mainnet.g.alchemy.com/v2/{apikey}"
+        apikeys:
+          # Same token as ethereum → the SAME bucket, automatically (§5.4).
+          - { token: "${ALCHEMY_KEY_A}", label: a,
+              buckets: [{ capacity: 330, refill_per_second: 330 }] }
+        methods: ["eth_*", "debug_*"]
+        archive: true
+
+limits:
+  max_total_attempts: 0        # 0 = unlimited (default); >0 = safety valve
+
+metrics:
+  enabled: true

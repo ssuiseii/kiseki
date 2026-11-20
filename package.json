@@ -8,10 +8,15 @@
   "scripts": {
     "test": "bun test packages",
     "test:core": "bun test packages/upstream-core",
-    "typecheck": "tsc --noEmit -p packages/upstream-core/tsconfig.json"
+    "test:kiseki": "bun test packages/kiseki",
+    "typecheck": "tsc --noEmit -p packages/upstream-core/tsconfig.json && tsc --noEmit -p packages/upstream-generic/tsconfig.json && tsc --noEmit -p packages/upstream-alchemy/tsconfig.json && tsc --noEmit -p packages/kiseki/tsconfig.json"
   },
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
   }
 }

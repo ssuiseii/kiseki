@@ -8,6 +8,7 @@
 
 import type { BucketRegistry } from "./bucket"
 import type { CapabilityErrorMatcher } from "./capsig"
+import type { CostTable } from "./cost"
 import type { AttemptCtx, Group } from "./types/group"
 import type { Logger } from "./types/logger"
 import type { UpstreamOutcome } from "./types/outcome"
@@ -24,6 +25,12 @@ export type CoreDeps = {
   now(): number
   /** Override for tests; defaults to global fetch. */
   fetchImpl?: typeof fetch
+  /**
+   * `defaults.costs` — the middle layer of design.md §5.3. The composition root
+   * fills this once per process; a provider package may pass its own table as
+   * the outer layer, and an instance's config `costs:` always wins over both.
+   */
+  globalCosts?: CostTable
 }
 
 export interface UpstreamAdapter {
