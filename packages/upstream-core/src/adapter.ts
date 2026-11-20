@@ -9,6 +9,8 @@
 import type { BucketRegistry } from "./bucket"
 import type { CapabilityErrorMatcher } from "./capsig"
 import type { CostTable } from "./cost"
+// Type-only, so the adapter↔pool cycle is erased at build time.
+import type { PoolObserver } from "./pool"
 import type { AttemptCtx, Group } from "./types/group"
 import type { Logger } from "./types/logger"
 import type { UpstreamOutcome } from "./types/outcome"
@@ -31,6 +33,14 @@ export type CoreDeps = {
    * the outer layer, and an instance's config `costs:` always wins over both.
    */
   globalCosts?: CostTable
+  /**
+   * Level-2 observability seam (design.md §18.1). The pool lives inside a
+   * provider package, so the router cannot wire `PoolObserver` per instance; the
+   * composition root supplies it once here and every adapter built from config
+   * reports key-level attempts through it. Additive and optional: a provider that
+   * passes its own `hooks.observer` still wins for that instance.
+   */
+  poolObserver?: PoolObserver
 }
 
 export interface UpstreamAdapter {

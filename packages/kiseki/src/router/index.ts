@@ -30,7 +30,7 @@ import {
   type UnsupportedItem,
   type UpstreamOutcome,
 } from "upstream-core"
-import type { Classified } from "../classify"
+import type { Classified, MethodClass } from "../classify"
 import type { RequestItem } from "../batch"
 import type { UpstreamView } from "../capability"
 import { broadcastUnknown, capacityExhausted, methodUnsupported, noHealthyUpstream } from "../errors"
@@ -53,8 +53,12 @@ export type RouterObserver = {
     method: string
     cap: "method" | "archive"
   }): void
-  /** A group ended on capacity/health, not on a provider answer (§12.1). */
-  onFailFast?(chain: string, reason: "rate_limited" | "sick"): void
+  /**
+   * A group ended on capacity/health, not on a provider answer (§12.1).
+   * `methodClass` is the item's class, carried so `kiseki_failfast_total` can use
+   * the label §18.1 specifies instead of the router's internal reason.
+   */
+  onFailFast?(chain: string, reason: "rate_limited" | "sick", methodClass: MethodClass): void
   /** `eth_sendRawTransaction` returned `ambiguous` (design.md §11.3). */
   onAmbiguous?(upstream: string): void
 }
@@ -299,7 +303,7 @@ const finalizeItem = (
   )
 
   if (end?.kind === "sick") {
-    deps.observer?.onFailFast?.(deps.chain, "sick")
+    deps.observer?.onFailFast?.(deps.chain, "sick", state.classified.methodClass)
     return {
       item: state.request,
       ok: false,
@@ -309,7 +313,7 @@ const finalizeItem = (
     }
   }
 
-  deps.observer?.onFailFast?.(deps.chain, "rate_limited")
+  deps.observer?.onFailFast?.(deps.chain, "rate_limited", state.classified.methodClass)
   return {
     item: state.request,
     ok: false,

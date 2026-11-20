@@ -8,8 +8,10 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "upstream-core": "workspace:*",
+    "hono": "^4.13.19",
+    "prom-client": "^15.1.3",
     "upstream-alchemy": "workspace:*",
+    "upstream-core": "workspace:*",
     "upstream-generic": "workspace:*",
     "yaml": "^2.9.1",
     "zod": "^4.6.7"

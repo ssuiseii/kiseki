@@ -106,9 +106,28 @@ export const loadConfigText = (text: string, options: LoadOptions): LoadedConfig
   }
 }
 
-/** Same pipeline, from a file. Used by the binary and by SIGHUP reload. */
-export const loadConfigFile = (path: string, options: LoadOptions): LoadedConfig =>
-  loadConfigText(readFileSync(path, "utf8"), options)
+/**
+ * Same pipeline, from a file. Used by the binary and by SIGHUP reload.
+ *
+ * A read failure becomes a `ConfigError` with the path, not a raw ENOENT: the
+ * operator asked "is my config valid", and "no such file" is a config problem
+ * reported in the same shape as every other one.
+ */
+export const loadConfigFile = (path: string, options: LoadOptions): LoadedConfig => {
+  let text: string
+  try {
+    text = readFileSync(path, "utf8")
+  } catch (error) {
+    const reason =
+      typeof error === "object" && error !== null && "code" in error
+        ? String((error as { code: unknown }).code)
+        : error instanceof Error
+          ? error.message
+          : String(error)
+    throw new ConfigError([{ path, message: `cannot read config file (${reason})` }])
+  }
+  return loadConfigText(text, options)
+}
 
 export type BuiltUpstream = {
   chain: string

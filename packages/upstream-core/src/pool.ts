@@ -501,6 +501,9 @@ export const createPoolAdapter = (
   const costFor = buildLayeredCostResolver([cfg.costs, hooks.costs, deps.globalCosts])
   const countsBatchAsOne =
     cfg.counts_batch_as_one_request ?? hooks.countsBatchAsOne ?? false
+  // A provider hook wins for its own instance; the process-wide seam is the
+  // fallback (design.md §18.1: level-2 attempts must be observable).
+  const observer = hooks.observer ?? deps.poolObserver
 
   const pool = new ApikeyPool({
     instance: cfg.name,
@@ -519,7 +522,7 @@ export const createPoolAdapter = (
     ...(hooks.headers === undefined ? {} : { headers: hooks.headers }),
     ...(cfg.timeout_ms === undefined ? {} : { timeoutMs: cfg.timeout_ms }),
     deps,
-    ...(hooks.observer === undefined ? {} : { observer: hooks.observer }),
+    ...(observer === undefined ? {} : { observer }),
     ...(hooks.random === undefined ? {} : { random: hooks.random }),
   })
 

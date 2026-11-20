@@ -24,6 +24,7 @@ import {
   classify,
   type Classified,
   type ClassifyOptions,
+  type MethodClass,
   type TimeoutPolicy,
 } from "../classify"
 import { methodUnsupported } from "../errors"
@@ -66,6 +67,13 @@ export type PipelineResult = {
   retryAfterMs?: number
   /** Unordered; tests assert on it, shaping sorts it. */
   results: ItemResult[]
+  /**
+   * Distinct method classes among the items of this request, for
+   * `kiseki_requests_total{method_class}` (§18.1). A batch can mix classes, so
+   * the server counts the request once per class it actually contained instead
+   * of inventing a single "batch class".
+   */
+  classes: MethodClass[]
 }
 
 const toResult = (outcome: ItemOutcome): ItemResult =>
@@ -93,7 +101,9 @@ const envelope = (result: ItemResult): Record<string, unknown> =>
 const prepare = (
   deps: PipelineDeps,
   request: RequestItem,
-): { ok: true; state: ItemState } | { ok: false; error: JsonRpcError } => {
+):
+  | { ok: true; state: ItemState }
+  | { ok: false; error: JsonRpcError; methodClass: MethodClass } => {
   const options: ClassifyOptions = {
     timeouts: deps.timeouts,
     blockedMethods: deps.blockedMethods,
@@ -103,7 +113,10 @@ const prepare = (
   const classified = classify(request.method, request.params, options)
   if (!classified.ok) {
     deps.observer?.onPreflightReject?.(deps.chain, "blocked")
-    return { ok: false, error: classified.error }
+    // A blocked method never got a class: it was rejected on policy, before the
+    // method-class question mattered. Report it as `default` so the counter still
+    // accounts for the request instead of dropping it.
+    return { ok: false, error: classified.error, methodClass: "default" }
   }
 
   const { needsArchive } = classified.classified
@@ -122,7 +135,11 @@ const prepare = (
       method: request.method,
       cap,
     })
-    return { ok: false, error: methodUnsupported(deps.chain, request.method, cap) }
+    return {
+      ok: false,
+      error: methodUnsupported(deps.chain, request.method, cap),
+      methodClass: classified.classified.methodClass,
+    }
   }
 
   return {
@@ -147,6 +164,7 @@ const prepare = (
 const shapeResponse = (
   results: readonly ItemResult[],
   outcomes: readonly ItemOutcome[],
+  classes: readonly MethodClass[],
 ): Omit<PipelineResult, "shape" | "body"> => {
   const capacityOutcomes = outcomes.filter((outcome) => outcome.capacity !== undefined)
   const allCapacity = capacityOutcomes.length > 0 && capacityOutcomes.length === results.length
@@ -161,6 +179,7 @@ const shapeResponse = (
     status: allCapacity ? 429 : 200,
     ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
     results: mergeResults(results),
+    classes: [...classes],
   }
 }
 
@@ -194,11 +213,14 @@ export const handle = async (
   }))
 
   const states: ItemState[] = []
+  const classes = new Set<MethodClass>()
   for (const request of parsed.items) {
     const prepared = prepare(deps, request)
     if (prepared.ok) {
       states.push(prepared.state)
+      classes.add(prepared.state.classified.methodClass)
     } else {
+      classes.add(prepared.methodClass)
       results.push({
         originalIndex: request.originalIndex,
         id: request.id,
@@ -211,7 +233,7 @@ export const handle = async (
   if (states.length === 0) {
     // Everything was rejected before routing: no attempt, no quota, HTTP 200
     // (design.md §12.3 row 4).
-    return withBody(shapeResponse(results, []), parsed)
+    return withBody(shapeResponse(results, [], [...classes]), parsed)
   }
 
   const outcomes = await route(
@@ -246,5 +268,5 @@ export const handle = async (
   )
 
   results.push(...outcomes.map(toResult))
-  return withBody(shapeResponse(results, outcomes), parsed)
+  return withBody(shapeResponse(results, outcomes, [...classes]), parsed)
 }

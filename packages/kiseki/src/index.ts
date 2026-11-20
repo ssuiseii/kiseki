@@ -1,9 +1,13 @@
 /**
- * `kiseki` — public surface of the routing core (Milestone 3).
+ * `kiseki` — public surface of the proxy (Milestones 3–4).
  *
- * The server (Milestone 4) consumes exactly this: parse a body, hand the items to
- * `handle`, shape the answer. Everything below the pipeline is reachable for
- * tests and for future callers, but the pipeline is the contract.
+ * Two layers, both exported:
+ *
+ *  - the **routing core**: parse a body, hand the items to `handle`, shape the
+ *    answer. `handle` is pure with respect to I/O, which is why the pipeline is
+ *    the contract and why the server is a thin adapter over it.
+ *  - the **process layer**: config → runtime, logger, metrics, Hono routes, SIGHUP
+ *    reload. Exported so the e2e test can drive a real server in-process.
  *
  * Deliberately absent: any provider import. Only `registry.ts` may import a
  * provider package (design.md §20).
@@ -72,3 +76,36 @@ export type { PipelineDeps, PipelineObserver, PipelineResult } from "./pipeline"
 
 export { createRuntime, retainIdentities } from "./runtime"
 export type { ChainRuntime, Runtime, RuntimeOptions } from "./runtime"
+
+export {
+  configFingerprints,
+  instanceFingerprint,
+  reloadRuntime,
+} from "./reload"
+export type { ReloadOptions, ReloadResult } from "./reload"
+
+export { createJsonLogger, collectSecrets, debugBodiesEnabled } from "./observ/logger"
+export type { JsonLoggerOptions, LogLevel } from "./observ/logger"
+
+export { createMetrics, metricKeyId } from "./observ/metrics"
+export type { Metrics, MetricsOptions } from "./observ/metrics"
+
+export {
+  authenticate,
+  buildKeyIndex,
+  extractCredentials,
+} from "./server/auth"
+export type {
+  AuthConfig,
+  AuthFailureReason,
+  AuthKeyConfig,
+  AuthResult,
+  Credentials,
+  KeyIndex,
+} from "./server/auth"
+
+export { createServer, redactPath, splitPath } from "./server/index"
+export type { ServerDeps, ServerHandle } from "./server/index"
+
+export { DEFAULT_CONFIG_PATH, USAGE, parseArgs, start } from "./main"
+export type { CliOptions, Started } from "./main"

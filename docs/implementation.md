@@ -115,8 +115,19 @@ type CoreDeps = {
   logger: Logger
   now(): number
   fetchImpl?: typeof fetch      // override untuk test
+  globalCosts?: CostTable       // lapisan tengah §5.3 (defaults.costs); M2
+  poolObserver?: PoolObserver   // seam observability level 2 §18.1; M4
 }
+```
 
+> Dua field opsional di atas adalah tambahan **aditif** di atas sketsa awal,
+> keduanya sudah disepakati sebelum diimplementasikan: `globalCosts` (M2) agar
+> `defaults.costs` punya jalur ke pool, dan `poolObserver` (M4, dikonfirmasi
+> eksplisit) karena pool hidup di dalam provider package sehingga router tidak
+> bisa memasang `PoolObserver` per instance. Bentuk `UpstreamAdapter`, taxonomy
+> `UpstreamOutcome`, dan seluruh tipe final lain **tidak berubah**.
+
+```ts
 interface UpstreamAdapter {
   readonly name: string                     // nama instance config
   readonly provider: string
@@ -327,8 +338,15 @@ Hono app, route sesuai design.md §16–17:
 ```
 GET  /healthz            → 200 (tanpa auth)
 GET  /metrics            → prom-client (tanpa auth, keputusan #33)
-POST /:chain/:key?       → authMiddleware → chainResolve → handler JSON-RPC
+POST /*                  → authMiddleware → chainResolve → handler JSON-RPC
 ```
+
+> Catatan implementasi (M4): sketsa awal memakai `POST /:chain/:key?`, tetapi
+> matcher Hono tidak memenuhi toleransi §16.3 — `/ethereum/` dan
+> `/ethereum/KEY/` sama-sama 404, padahal keduanya harus valid (yang pertama =
+> request tanpa path-key). Karena itu route-nya `POST /*` dengan pemecahan path
+> manual di `splitPath()`: trailing slash dibuang, segmen kosong = tanpa key.
+> Setiap bentuk di §16.3 punya test sendiri di `server.test.ts`.
 
 Auth middleware (urutan wajib, §16.3):
 
@@ -347,6 +365,17 @@ SIGHUP → reload pipeline §6; bucket registry di-retain (identity-keyed);
 adapter instance yang konfigurasinya berubah dibuat ulang; runtime note
 capability direset (design.md §19).
 
+Implementasi M4 menambahkan dua hal kecil di atas sketsa ini, keduanya untuk
+memenuhi §19/§18.1 secara literal:
+
+- **Adapter yang config-nya tidak berubah di-reuse** (bukan dibuat ulang), karena
+  pool menyimpan state internal — provider-level sick cooldown §13 — yang akan
+  hilang kalau objeknya dibangun ulang. Reusability diputuskan lewat fingerprint
+  config per instance (`instanceFingerprint`), yang mencakup URL, apikey+bucket,
+  methods, archive, costs, dan timeout.
+- **Reload yang gagal validasi tidak mengganti runtime**; proses lama tetap
+  melayani. Typo tidak boleh menjatuhkan proxy yang sedang jalan.
+
 ---
 
 ## 8. Milestone
@@ -356,10 +385,10 @@ Definition of Done; commit per milestone.
 
 | # | Isi | DoD |
 |---|---|---|
-| **M1** | `upstream-core`: types, bucket, capsig, result, pool, http, registry + test unit | `bun test packages/upstream-core` hijau: refill lazy, identity sharing, deduct per item, weighted-random pool, 429→failover key, capsig matrix, terminasi |
-| **M2** | `upstream-generic` + `upstream-alchemy` (tipis) + `kiseki/config` (zod + pipeline) | config contoh design.md §15 lolos validasi & membangun adapter instances; error config ter-handle jelas |
-| **M3** | `kiseki`: classify, capability pre-flight, batch split + **regroup loop**, router weighted-random | test router: Σ headroom, regroup item mismatch ke upstream kedua, finalisasi #36, sendRaw 3-kelas |
-| **M4** | `kiseki/server`: Hono + auth path-key/Bearer + shaping + metrics + logger + SIGHUP | test auth ordering (401 vs 404), shaping 429/200 parsial, `/metrics` label benar |
+| **M1** ✅ | `upstream-core`: types, bucket, capsig, result, pool, http, registry + test unit | `bun test packages/upstream-core` hijau: refill lazy, identity sharing, deduct per item, weighted-random pool, 429→failover key, capsig matrix, terminasi |
+| **M2** ✅ | `upstream-generic` + `upstream-alchemy` (tipis) + `kiseki/config` (zod + pipeline) | config contoh design.md §15 lolos validasi & membangun adapter instances; error config ter-handle jelas |
+| **M3** ✅ | `kiseki`: classify, capability pre-flight, batch split + **regroup loop**, router weighted-random | test router: Σ headroom, regroup item mismatch ke upstream kedua, finalisasi #36, sendRaw 3-kelas |
+| **M4** ✅ | `kiseki/server`: Hono + auth path-key/Bearer + shaping + metrics + logger + SIGHUP | test auth ordering (401 vs 404), shaping 429/200 parsial, `/metrics` label benar — **selesai**: `auth`, `server`, `metrics`, `logger`, `reload`, `e2e`, `main` test (129 test baru; suite 351 → 480) |
 | **M5** | E2E `Bun test` dengan mock upstream + `bun build --compile` + `kiseki.service` | satu binary jalan dengan config nyata; e2e batch campuran sukses |
 
 Estimasi relatif: M1 adalah fondasi terberat; M2–M4 tipis karena kontrak

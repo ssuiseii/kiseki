@@ -899,3 +899,80 @@ describe("createPoolAdapter", () => {
     expect(registry.peek("alchemy", "KEY_A")!.credits(0)).toEqual([96])
   })
 })
+
+describe("pool: the CoreDeps.poolObserver seam (design.md §18.1)", () => {
+  // The router cannot wire a per-instance PoolObserver: the pool lives inside the
+  // provider package. `CoreDeps.poolObserver` is the process-wide seam the
+  // composition root fills so `kiseki_pool_key_*` metrics see key attempts.
+  const cfg = {
+    name: "alchemy-ethereum",
+    provider: "alchemy",
+    package: "alchemy",
+    url_template: "https://eth-mainnet.g.alchemy.com/v2/{apikey}",
+    apikeys: [{ token: "KEY_A", label: "a", buckets: [{ capacity: 100, refill_per_second: 10 }] }],
+    methods: ["eth_*", "trace_*"],
+    archive: true,
+  }
+
+  test("an adapter built from config reports key attempts through CoreDeps", async () => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl } = makeFetch([{ kind: "json", body: okResult(0, "0x1") }])
+    const seen: string[] = []
+
+    const adapter = createPoolAdapter(cfg, {
+      bucketRegistry: registry,
+      logger: silentLogger,
+      now: clock.now,
+      fetchImpl,
+      poolObserver: {
+        onKeyAttempt: (upstream, label, outcome) => seen.push(`${upstream}:${label}:${outcome}`),
+        onKeyFailover: (upstream) => seen.push(`failover:${upstream}`),
+      },
+    })
+
+    await adapter.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(seen).toEqual(["alchemy-ethereum:a:success"])
+  })
+
+  test("a provider hook still wins over the process-wide seam", async () => {
+    // A provider package that wants its own observer keeps it; the seam is a
+    // fallback, not an override.
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl } = makeFetch([{ kind: "json", body: okResult(0, "0x1") }])
+    const fromDeps: string[] = []
+    const fromHook: string[] = []
+
+    const adapter = createPoolAdapter(
+      cfg,
+      {
+        bucketRegistry: registry,
+        logger: silentLogger,
+        now: clock.now,
+        fetchImpl,
+        poolObserver: { onKeyAttempt: (_u, label) => fromDeps.push(label) },
+      },
+      { observer: { onKeyAttempt: (_u, label) => fromHook.push(label) } },
+    )
+
+    await adapter.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(fromHook).toEqual(["a"])
+    expect(fromDeps).toEqual([])
+  })
+
+  test("omitting the seam leaves the pool silent, not broken", async () => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl } = makeFetch([{ kind: "json", body: okResult(0, "0x1") }])
+
+    const adapter = createPoolAdapter(cfg, {
+      bucketRegistry: registry,
+      logger: silentLogger,
+      now: clock.now,
+      fetchImpl,
+    })
+    const outcome = await adapter.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("success")
+  })
+})
