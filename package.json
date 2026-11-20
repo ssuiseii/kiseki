@@ -1,0 +1,17 @@
+{
+  "name": "kiseki-monorepo",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "bun test packages",
+    "test:core": "bun test packages/upstream-core",
+    "typecheck": "tsc --noEmit -p packages/upstream-core/tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  }
+}
