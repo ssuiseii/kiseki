@@ -15,7 +15,7 @@
  */
 
 import { resolve } from "node:path"
-import { ConfigError, loadConfigFile, formatSharedIdentity } from "./config/index"
+import { loadConfigFile, formatSharedIdentity } from "./config/index"
 import { createJsonLogger, collectSecrets, type JsonLoggerOptions } from "./observ/logger"
 import { createMetrics, metricKeyId, type Metrics } from "./observ/metrics"
 import { buildRegistry } from "./registry"
@@ -138,16 +138,12 @@ export const start = async (options: {
   // Load once to learn the secrets, then build the real logger and metrics, then
   // build the runtime — the adapters must be created AFTER the pool observer exists
   // (§18.1), and the logger must exist BEFORE any adapter logs.
-  let loaded
-  try {
-    loaded = loadConfigFile(options.configPath, { env, registry })
-  } catch (error) {
-    if (error instanceof ConfigError) {
-      // The message already lists every problem by path and never a value.
-      process.stderr.write(`${error.message}\n`)
-    }
-    throw error
-  }
+  //
+  // A config error is rethrown WITHOUT writing anything: `start()` is called by
+  // tests and by `reload()`, and the process edge (`runCli`) is the one place that
+  // decides what a human sees. Writing here too made a startup failure print its
+  // message twice.
+  const loaded = loadConfigFile(options.configPath, { env, registry })
 
   const logger = createJsonLogger({
     level: logLevel(env),
@@ -309,9 +305,23 @@ export const main = async (
   return 0
 }
 
-// Only run when executed directly, never when imported by a test.
-if (import.meta.main) {
-  main().then(
+/**
+ * Run the CLI at a process boundary: `main()` plus the exit-code policy
+ * (a config error prints once and exits 1, never a stack trace).
+ *
+ * Exported because more than one module may be the entry module, and
+ * `import.meta.main` is true only for the one the bundler was pointed at:
+ *
+ *  - `src/main.ts` when run directly (`bun run src/main.ts`);
+ *  - `src/cli.ts` in the compiled binary, which calls this unconditionally.
+ *
+ * Keeping the policy in one function is what stops those two paths from drifting.
+ */
+export const runCli = (
+  argv: readonly string[] = process.argv.slice(2),
+  env: Record<string, string | undefined> = process.env,
+): void => {
+  void main(argv, env).then(
     (code) => {
       if (code !== 0) process.exit(code)
     },
@@ -321,4 +331,7 @@ if (import.meta.main) {
     },
   )
 }
+
+// Only run when executed directly, never when imported by a test.
+if (import.meta.main) runCli()
 

@@ -267,6 +267,40 @@ describe("redactPath (§16.4 — a key must never be echoed)", () => {
   test("an empty path is unchanged", () => {
     expect(redactPath("/")).toBe("/")
   })
+
+  /**
+   * The M4 hand-off flagged this as a future hazard: `redactPath` assumes exactly
+   * ONE non-secret segment (the chain), so a route with a second non-secret
+   * segment would have that segment masked in every error and log line.
+   *
+   * Rather than rely on someone remembering, the assumption is now asserted
+   * against the REAL route table. The day a route like `/chains/{chain}/status`
+   * is added, this test fails and points at `redactPath` — which is the moment to
+   * teach it which segments are not secrets.
+   */
+  test("the route table really has only one non-secret path segment (assumption behind redactPath)", () => {
+    const { server } = stack()
+    const patterns = server.app.routes.map((route) => route.path)
+
+    expect(patterns).toContain("/healthz")
+    expect(patterns).toContain("/metrics")
+
+    // `redactPath` keeps segment 0 and masks the rest, so it is only correct while
+    // no route has a SECOND fixed segment. Parameter (`:x`) and wildcard (`*`)
+    // segments are not fixed: the only one is the path-key, which IS the secret.
+    const violations = patterns
+      .map((pattern) => ({
+        pattern,
+        fixed: pattern
+          .split("/")
+          .filter((segment) => segment !== "" && !segment.startsWith(":") && segment !== "*"),
+      }))
+      .filter((entry) => entry.fixed.length > 1)
+
+    // On failure, teach `redactPath` which segments are not secrets before
+    // adding the route — that is the whole point of this test.
+    expect(violations).toEqual([])
+  })
 })
 
 describe("body handling (design.md §10.3, §17.1)", () => {

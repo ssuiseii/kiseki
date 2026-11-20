@@ -7,6 +7,12 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "scripts": {
+    "build": "bun build --compile --outfile dist/kiseki src/cli.ts",
+    "dev": "bun run src/cli.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
   "dependencies": {
     "hono": "^4.13.19",
     "prom-client": "^15.1.3",

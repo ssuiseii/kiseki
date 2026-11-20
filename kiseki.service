@@ -1,0 +1,71 @@
+[Unit]
+# Kiseki RPC proxy — design.md §21.
+Description=Kiseki RPC Proxy
+Documentation=file:/opt/kiseki/docs/design.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=kiseki
+Group=kiseki
+
+# Single compiled binary; no runtime dependency on the host (§21).
+ExecStart=/opt/kiseki/kiseki --config /etc/kiseki/kiseki.yaml
+
+# Secrets (${VAR} in kiseki.yaml) come from here, never from this unit file:
+# EnvironmentFile should be root-owned mode 0600 so a token is not readable
+# through `systemctl cat`.
+EnvironmentFile=/etc/kiseki/env
+
+Restart=always
+RestartSec=2
+
+# SIGHUP reloads the config in place (§19): buckets and cooldowns survive, and a
+# failed validation keeps the running config serving. `systemctl reload kiseki`
+# is therefore safe to run on every config change.
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=35s
+
+# The logger writes one JSON object per line to stdout (§18.2); journald keeps
+# them verbatim, so `journalctl -u kiseki -o cat | jq` parses every line.
+StandardOutput=journal
+StandardError=journal
+
+# --- Hardening ------------------------------------------------------------
+# The proxy holds no state on disk (§19): everything lives in memory and is
+# rebuilt from config, so the filesystem can be read-only.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+# Deliberately NOT set, and why:
+#
+#   MemoryDenyWriteExecute=yes   Bun's JavaScriptCore JIT needs writable+executable
+#                                pages; the service would crash on first compile.
+#   IPAddressDeny=any            would also block OUTBOUND traffic, i.e. every
+#                                call to Alchemy/Ankr. Ingress is restricted by
+#                                the bind address instead (§16.4).
+#   ProtectProc=invisible        not needed, and hides the PID that ExecReload
+#                                signals on older systemd.
+#
+# §16.4: the path-key channel puts a client key in the URL, so binding beyond
+# localhost is a deliberate decision (design.md Lampiran B item 5). The default
+# config binds 127.0.0.1. If the proxy must serve another machine, prefer a
+# reverse proxy WITHOUT path logging over binding 0.0.0.0 here.
+
+[Install]
+WantedBy=multi-user.target

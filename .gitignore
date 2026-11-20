@@ -2,3 +2,10 @@ node_modules/
 dist/
 *.tsbuildinfo
 .DS_Store
+
+# Secrets. The proxy reads ${VAR} from the environment (design.md §15.1 rule 4)
+# and kiseki.service points EnvironmentFile at /etc/kiseki/env, so a local .env
+# is a convenience file that must never reach git: it holds live provider keys.
+.env
+.env.*
+!.env.example

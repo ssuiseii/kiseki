@@ -376,6 +376,25 @@ memenuhi §19/§18.1 secara literal:
 - **Reload yang gagal validasi tidak mengganti runtime**; proses lama tetap
   melayani. Typo tidak boleh menjatuhkan proxy yang sedang jalan.
 
+### 7.1 `redactPath` — satu asumsi yang sekarang dijaga test
+
+`redactPath()` mempertahankan segmen path pertama (chain, bukan rahasia) dan
+mengganti **semua** segmen sisanya dengan `*`, karena segmen kedua adalah
+path-key (§16.4). Itu benar hanya selama **tidak ada route dengan segmen tetap
+kedua**.
+
+Catatan serah-terima M4 sudah menandai ini sebagai hazard untuk M5. Alih-alih
+mengandalkan ingatan, asumsinya sekarang diuji terhadap tabel route yang
+sesungguhnya (`server.test.ts`, "the route table really has only one non-secret
+path segment"): test itu mengumpulkan semua `app.routes`, menghitung segmen
+tetap (bukan `:param`, bukan `*`), dan gagal bila ada route dengan lebih dari
+satu. Jadi menambah route seperti `/chains/{chain}/status` tidak akan diam-diam
+membuat segmen `chains` ikut disensor — test-nya merah dan menunjuk ke
+`redactPath()`.
+
+Segmen `:param` dan `*` sengaja tidak dihitung sebagai "tetap": satu-satunya
+segmen dinamis yang ada sekarang adalah path-key, yang justru rahasianya.
+
 ---
 
 ## 8. Milestone
@@ -389,7 +408,68 @@ Definition of Done; commit per milestone.
 | **M2** ✅ | `upstream-generic` + `upstream-alchemy` (tipis) + `kiseki/config` (zod + pipeline) | config contoh design.md §15 lolos validasi & membangun adapter instances; error config ter-handle jelas |
 | **M3** ✅ | `kiseki`: classify, capability pre-flight, batch split + **regroup loop**, router weighted-random | test router: Σ headroom, regroup item mismatch ke upstream kedua, finalisasi #36, sendRaw 3-kelas |
 | **M4** ✅ | `kiseki/server`: Hono + auth path-key/Bearer + shaping + metrics + logger + SIGHUP | test auth ordering (401 vs 404), shaping 429/200 parsial, `/metrics` label benar — **selesai**: `auth`, `server`, `metrics`, `logger`, `reload`, `e2e`, `main` test (129 test baru; suite 351 → 480) |
-| **M5** | E2E `Bun test` dengan mock upstream + `bun build --compile` + `kiseki.service` | satu binary jalan dengan config nyata; e2e batch campuran sukses |
+| **M5** ✅ | E2E `Bun test` dengan mock upstream + `bun build --compile` + `kiseki.service` | satu binary jalan dengan config nyata; e2e batch campuran sukses — **selesai**: `binary.test.ts` (20 test; suite 486 → 507, termasuk 1 guard `redactPath`) mengompilasi binary sungguhan lalu menjalankannya sebagai proses: batch campuran di-split ke dua provider, domain error passthrough, pre-flight tanpa HTTP, 429 + Retry-After, urutan 401→404, SIGHUP reload & SIGTERM bersih. Dua bug laten ditemukan & diperbaiki (lihat §8.1) |
+
+### 8.1 Catatan M5 — dua bug laten di boundary proses
+
+Keduanya tidak bisa terlihat dari test in-process M4, dan keduanya sudah ada di
+kode sebelum M5:
+
+1. **Entry module.** `import.meta.main` hanya `true` di modul yang ditunjuk
+   bundler. `bun build --compile src/index.ts` — perintah yang ditulis di
+   design.md §21 — menghasilkan binary yang **exit 0 tanpa pernah listen**, karena
+   `index.ts` adalah permukaan library dan guard di `main.ts` tidak pernah jalan.
+   Perbaikan: `src/cli.ts` (satu baris, selalu jalan) menjadi entry build;
+   `runCli()` diekspor dari `main.ts` supaya kedua jalur memakai satu kebijakan
+   exit code. `index.ts` tetap murni library.
+2. **Pesan config ganda.** `start()` menulis `ConfigError` ke stderr lalu
+   melemparnya, dan `runCli` menulisnya lagi — satu kegagalan startup tercetak
+   dua kali, yang terbaca seperti crash loop. Perbaikan: `start()` tidak menulis
+   apa pun; hanya process edge yang memutuskan apa yang dilihat manusia.
+
+Konsekuensi yang perlu disadari: **perintah build di design.md §21
+(`bun build --compile src/index.ts`) bukan perintah yang dipakai.** Yang dipakai
+`packages/kiseki` script `build` → `src/cli.ts`. Ini deviasi sadar dari dokumen
+desain, dicatat di sini alih-alih diubah diam-diam; kalau §21 ingin diselaraskan,
+itu revisi dokumen, bukan keputusan implementasi.
+
+### 8.2 `kiseki.service` — apa yang sengaja TIDAK dipasang
+
+Unit di root repo mengikuti sketsa §21 dan menambah hardening yang aman untuk
+binary tunggal tanpa state disk (§19). Tiga direktif yang biasanya ikut di
+template hardening **dihilangkan dengan sengaja**, dan alasannya ditulis di unit:
+
+| Direktif | Kenapa tidak dipasang |
+|---|---|
+| `MemoryDenyWriteExecute=yes` | JIT JavaScriptCore Bun butuh halaman W+X; service akan crash saat kompilasi pertama |
+| `IPAddressDeny=any` | memblokir **keluar** juga — setiap panggilan ke Alchemy/Ankr gagal. Ingress dibatasi lewat bind (§16.4) |
+| `ProtectProc=invisible` | tidak perlu, dan menyembunyikan PID yang di-signal `ExecReload` di systemd lama |
+
+`ExecReload=/bin/kill -HUP $MAINPID` dipasang karena §19 menjamin reload aman
+(bucket/cooldown bertahan, config gagal validasi tidak mengganti runtime), jadi
+`systemctl reload kiseki` boleh dijalankan pada setiap perubahan config.
+
+### 8.3 Perintah build & deploy
+
+```bash
+bun install
+bun test                       # 507 test
+bun run build                  # → packages/kiseki/dist/kiseki  (bun build --compile src/cli.ts)
+bun run check                  # typecheck + seluruh test
+```
+
+Menaruh binary: `/opt/kiseki/kiseki`, config `/etc/kiseki/kiseki.yaml`, secret
+`/etc/kiseki/env` (mode 0600). `kiseki.service` di root repo menunjuk ketiganya.
+`--check` berguna sebelum restart/reload:
+
+```bash
+/opt/kiseki/kiseki --config /etc/kiseki/kiseki.yaml --check && systemctl reload kiseki
+```
+
+Catatan ukuran: binary hasil `--compile` ≈ 105 MB karena membawa runtime Bun
+beserta JIT JavaScriptCore. Itu konsekuensi "tanpa runtime dependency di host"
+(§21) dan bukan regresi; kalau ukuran jadi masalah, opsinya ada di dokumen
+desain (bukan di sini).
 
 Estimasi relatif: M1 adalah fondasi terberat; M2–M4 tipis karena kontrak
 sudah final di dokumen ini.
@@ -423,6 +503,12 @@ Skenario kunci (nama test = perilaku yang dijanjikan desain):
 9. `shaping: batch parsial 200, semua-capacity 429 + Retry-After estimasi`.
 10. `e2e: batch campuran sukses/domain/mismatch regroup` — server nyata +
     mock upstream fetchImpl.
+11. `binary: batch campuran lewat binary hasil compile` — proses sungguhan,
+    mock upstream HTTP sungguhan (bukan `fetchImpl`), split dua provider, merge
+    per index; plus `--check`, SIGHUP reload, SIGTERM bersih, 429 + Retry-After.
+    `binary.test.ts` juga memastikan artefaknya benar-benar ELF dan bahwa
+    `kiseki.service` cocok dengan perintah build (ExecStart, ExecReload,
+    EnvironmentFile, dan direktif hardening yang sengaja tidak dipasang).
 
 Konsistensi log: TIDAK ADA test/pernyataan yang menuntut token/key mentah
 muncul di log (logger di-inject; fake logger memverifikasi).
