@@ -47,13 +47,45 @@ describe("kiseki.yaml (the design.md §15 example) — Milestone 2 DoD", () => {
     const ethereum = model.upstreams.get("ethereum")!
     expect(ethereum.map((entry) => entry.adapter.name)).toEqual([
       "alchemy-ethereum",
-      "ankr-ethereum",
+      "ankr-ethereum-aapi",
+      "ankr-ethereum-node",
     ])
     expect(ethereum[0]!.adapter.capability()).toEqual({
       methods: ["eth_*", "trace_*", "debug_*", "replay_*"],
       archive: true,
     })
     expect(ethereum[1]!.adapter.capability().archive).toBe(false)
+  })
+
+  test("Ankr is split into an AAPI and a node instance (plan/notes-m0.md §1)", () => {
+    const loaded = loadConfigText(exampleText, { env, registry: buildRegistry() })
+    const model = buildModel(loaded, deps(), buildRegistry())
+    const ankr = model.upstreams
+      .get("ethereum")!
+      .filter((entry) => entry.adapter.name.startsWith("ankr-ethereum-"))
+
+    const aapi = ankr.find((entry) => entry.adapter.name === "ankr-ethereum-aapi")!
+    const node = ankr.find((entry) => entry.adapter.name === "ankr-ethereum-node")!
+
+    // The two APIs live on different endpoints; mixing them in one instance
+    // would regroup forever (each endpoint -32601s the other's methods).
+    expect(aapi.config.url_template).toContain("/multichain/")
+    expect(node.config.url_template).toContain("/eth/")
+
+    // AAPI covers the raw methods AND the derived canonical namespace.
+    const aapiMethods = aapi.adapter.capability().methods
+    expect(aapiMethods).toContain("ankr_*")
+    expect(aapiMethods).toContain("kiseki_getTokenTransfers")
+    expect(aapiMethods).toContain("kiseki_getTokenPrice")
+    expect(aapiMethods).not.toContain("eth_*")
+
+    // The node instance covers only node methods and advertises no kiseki_*.
+    expect(node.adapter.capability().methods).toEqual(["eth_*"])
+
+    // kiseki_* must never be written by hand in config: it is derived.
+    for (const entry of ankr) {
+      expect(entry.config.methods.some((method) => method.startsWith("kiseki_"))).toBe(false)
+    }
   })
 
   test("reports the shared apikey identity across chains (§5.4 rule 8)", () => {

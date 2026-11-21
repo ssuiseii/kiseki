@@ -53,13 +53,40 @@ chains:
         costs: { "eth_call": 2, "trace_block": 5 }   # override over the CU table
         counts_batch_as_one_request: false
 
-      - name: ankr-ethereum
-        provider: ankr
-        package: generic                 # no provider package needed
+      # ── Ankr, split in two — this is not a style choice ──────────────────
+      # Ankr serves its Advanced API (`ankr_*`) ONLY on the multichain endpoint,
+      # and that endpoint rejects every node method (`eth_blockNumber` → -32601).
+      # The per-chain endpoint is the mirror image: `ankr_*` → -32601. One
+      # instance has one `url_template`, so one instance cannot serve both.
+      # Verified live; see plan/notes-m0.md §1.
+      - name: ankr-ethereum-aapi
+        # ⚠️ `provider` is the bucket-sharing identity (§5.4) and the two Ankr
+        # halves must NOT share it: they are metered in different units (API
+        # credits vs RPS). Sharing one identity with two different bucket specs
+        # would silently rebuild the bucket and discard spent credits.
+        # Same provider string on another chain DOES share the AAPI credit pool.
+        provider: ankr-aapi
+        package: ankr                   # supplies kiseki_* translations + 700 credits
+        url_template: "https://rpc.ankr.com/multichain/{apikey}"
+        apikeys:
+          # ⚠️ Advanced API = 700 credits PER REQUEST. A bucket sized for RPS is
+          # drained ~47× faster than by eth_call, so size these in credits: the
+          # numbers below allow ~1.7 AAPI calls/second sustained.
+          - token: "${ANKR_KEY}"
+            label: main
+            buckets:
+              - { capacity: 1200, refill_per_second: 1200 }  # credits (≈1.7 AAPI/s)
+        # `ankr_*` also exposes the raw Advanced API methods directly (decision F3).
+        # Coverage of `kiseki_*` is DERIVED from the package translation table —
+        # never list kiseki_* here.
+        methods: ["ankr_*"]
+        archive: false
+
+      - name: ankr-ethereum-node
+        provider: ankr-node             # own identity: RPS/RPM metering
+        package: generic                # plain JSON-RPC, nothing Ankr-specific
         url_template: "https://rpc.ankr.com/eth/{apikey}"
         apikeys:
-          # Two buckets = two limit dimensions (RPS and RPM), both deducted
-          # together with the same cost (design.md §5.2).
           - token: "${ANKR_KEY}"
             label: main
             buckets:
