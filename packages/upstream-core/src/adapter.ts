@@ -7,7 +7,6 @@
  */
 
 import type { BucketRegistry } from "./bucket"
-import type { CapabilityErrorMatcher } from "./capsig"
 import type { CostTable } from "./cost"
 // Type-only, so the adapter↔pool cycle is erased at build time.
 import type { PoolObserver } from "./pool"
@@ -88,16 +87,9 @@ export type AdapterFactory = (
   deps: CoreDeps,
 ) => UpstreamAdapter
 
-/** Everything a provider package may need to customize. */
-export type ProviderHooks = {
-  /** Provider error signature, on top of the generic fallback (§8.3). */
-  matchCapabilityError?: CapabilityErrorMatcher
-  /** Cost override table: provider-specific units (§5.3). */
-  costs?: Record<string, number>
-  /** Headers added to every request (provider quirks). */
-  headers?: (token: string) => Record<string, string>
-  /** Providers that bill per HTTP call rather than per item (§5.5 rule 2). */
-  countsBatchAsOne?: boolean
-  /** Default per-instance timeout, overridable by config. */
-  defaultTimeoutMs?: number
-}
+/**
+ * Everything a provider package may customize lives in `AdapterHooks` (`pool.ts`),
+ * next to the engine that consumes it — this file used to carry a parallel
+ * `ProviderHooks` type with drifting field names, which nothing read. One hook
+ * type, one definition, no drift.
+ */

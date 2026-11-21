@@ -898,6 +898,113 @@ describe("createPoolAdapter", () => {
     await adapter.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
     expect(registry.peek("alchemy", "KEY_A")!.credits(0)).toEqual([96])
   })
+
+  // The canonical namespace is additive: an adapter built without `translations`
+  // must behave exactly as it did before it existed (plan A §4.1).
+  test("without translations the capability is the configured one, byte for byte", () => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const adapter = createPoolAdapter(cfg, {
+      bucketRegistry: registry,
+      logger: silentLogger,
+      now: clock.now,
+    })
+    expect(adapter.capability()).toEqual({ methods: ["eth_*", "trace_*"], archive: true })
+  })
+
+  test("the quota of a canonical item is charged under its upstream name", async () => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl, calls } = makeFetch([
+      { kind: "json", body: okResult(0, { ok: true }) },
+    ])
+    const adapter = createPoolAdapter(
+      { ...cfg, methods: ["eth_*", "trace_*", "alchemy_*"] },
+      { bucketRegistry: registry, logger: silentLogger, now: clock.now, fetchImpl },
+      {
+        costs: { "alchemy_*": 40 },
+        translations: [
+          {
+            canonical: "kiseki_getTokenBalances",
+            upstream: "alchemy_getTokenBalances",
+            mapRequest: (params) => [...params],
+            mapResponse: (result) => result,
+          },
+        ],
+      },
+    )
+
+    expect(adapter.capability().methods).toContain("kiseki_getTokenBalances")
+
+    await adapter.attempt(
+      group([
+        {
+          originalIndex: 0,
+          id: 0,
+          method: "kiseki_getTokenBalances",
+          params: ["0xabc"],
+          historical: false,
+        },
+      ]),
+      ctx(clock.now),
+    )
+
+    expect((calls[0]!.body as { method: string }).method).toBe("alchemy_getTokenBalances")
+    // 100 − 40 (the alchemy_* price), not 100 − 1.
+    expect(registry.peek("alchemy", "KEY_A")!.credits(0)).toEqual([60])
+  })
+
+  // `mapRequest` may return any shape the provider documents: an array of
+  // positional values (the node API) or an object of named fields (an enhanced
+  // API). The pool forwards it verbatim as the JSON-RPC `params` field.
+  const translatedBody = async (mapRequest: () => unknown) => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl, calls } = makeFetch([{ kind: "json", body: okResult(0, "0x1") }])
+    const adapter = createPoolAdapter(
+      { ...cfg, methods: ["eth_*", "trace_*", "alchemy_*"] },
+      { bucketRegistry: registry, logger: silentLogger, now: clock.now, fetchImpl },
+      {
+        translations: [
+          {
+            canonical: "kiseki_getTokenBalances",
+            upstream: "alchemy_getTokenBalances",
+            mapRequest,
+            mapResponse: (result) => result,
+          },
+        ],
+      },
+    )
+    await adapter.attempt(
+      group([
+        { originalIndex: 0, id: 7, method: "kiseki_getTokenBalances", params: ["0xabc"], historical: false },
+      ]),
+      ctx(clock.now),
+    )
+    return calls[0]!.body as { jsonrpc: string; id: unknown; method: string; params: unknown }
+  }
+
+  test("an object from mapRequest is sent as the JSON-RPC params, verbatim", async () => {
+    const body = await translatedBody(() => ({ address: "0xabc", chain: "eth", pageSize: 5 }))
+    expect(body.params).toEqual({ address: "0xabc", chain: "eth", pageSize: 5 })
+    expect(Array.isArray(body.params)).toBe(false)
+  })
+
+  test("an array from mapRequest still works (backward compatible)", async () => {
+    const body = await translatedBody(() => ["0xabc", "latest"])
+    expect(body.params).toEqual(["0xabc", "latest"])
+    expect(Array.isArray(body.params)).toBe(true)
+  })
+
+  test("a translation that rewrites params keeps the client's id and the upstream method", async () => {
+    const body = await translatedBody(() => ({ address: "0xabc" }))
+    expect(body).toEqual({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "alchemy_getTokenBalances",
+      params: { address: "0xabc" },
+    })
+  })
 })
 
 describe("pool: the CoreDeps.poolObserver seam (design.md §18.1)", () => {
