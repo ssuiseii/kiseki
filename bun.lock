@@ -20,6 +20,7 @@
         "hono": "^4.13.19",
         "prom-client": "^15.1.3",
         "upstream-alchemy": "workspace:*",
+        "upstream-ankr": "workspace:*",
         "upstream-core": "workspace:*",
         "upstream-generic": "workspace:*",
         "yaml": "^2.9.1",
@@ -28,6 +29,13 @@
     },
     "packages/upstream-alchemy": {
       "name": "upstream-alchemy",
+      "version": "0.1.0",
+      "dependencies": {
+        "upstream-core": "workspace:*",
+      },
+    },
+    "packages/upstream-ankr": {
+      "name": "upstream-ankr",
       "version": "0.1.0",
       "dependencies": {
         "upstream-core": "workspace:*",
@@ -69,6 +77,8 @@
     "undici-types": ["undici-types@8.9.0", "", {}, "sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg=="],
 
     "upstream-alchemy": ["upstream-alchemy@workspace:packages/upstream-alchemy"],
+
+    "upstream-ankr": ["upstream-ankr@workspace:packages/upstream-ankr"],
 
     "upstream-core": ["upstream-core@workspace:packages/upstream-core"],
 

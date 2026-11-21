@@ -11,15 +11,18 @@
 
 import { AdapterRegistry } from "upstream-core"
 import { createAdapter as createAlchemyAdapter } from "upstream-alchemy"
+import { createAdapter as createAnkrAdapter } from "upstream-ankr"
 import { createAdapter as createGenericAdapter } from "upstream-generic"
 
 /** Package name used by the `package:` config key, per provider (design.md §15). */
 export const PACKAGE_GENERIC = "generic"
 export const PACKAGE_ALCHEMY = "alchemy"
+export const PACKAGE_ANKR = "ankr"
 
 export function buildRegistry(): AdapterRegistry {
   const registry = new AdapterRegistry()
   registry.register(PACKAGE_GENERIC, createGenericAdapter)
   registry.register(PACKAGE_ALCHEMY, createAlchemyAdapter)
+  registry.register(PACKAGE_ANKR, createAnkrAdapter)
   return registry
 }
