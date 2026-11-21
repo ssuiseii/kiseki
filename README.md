@@ -35,6 +35,13 @@ ambiguous result (timeout, 5xx after broadcast) stops *all* failover dead, so
 you never end up with "success from upstream two" for a transaction that may
 already be in the mempool.
 
+**One namespace for provider-specific APIs.** Providers expose their own
+non-standard methods (`ankr_getTokenTransfers`, `alchemy_getAssetTransfers`, …)
+that differ in name, params and shape. Kiseki serves a neutral `kiseki_*`
+namespace on top: call `kiseki_getTokenTransfers` and the provider package
+translates both directions into one stable, provider-independent shape. The raw
+provider method still works if you want it.
+
 **Keys stay keys.** Client auth is path-key (`http://host:8545/ethereum/YOUR_KEY`)
 or Bearer — whichever your tooling prefers, validated against the same
 allowlist. Upstream apikey tokens and client keys are never logged, only labels.
@@ -147,6 +154,36 @@ The whole process is one short file plus a two-line registration — see
 [docs/upstream-package-guide.md](docs/upstream-package-guide.md) for the
 step-by-step tutorial and the full hook reference.
 
+### The `kiseki_*` namespace
+
+Six methods are currently canonical, all served by the Ankr package:
+
+| Canonical | Ankr upstream |
+|---|---|
+| `kiseki_getTokenTransfers` | `ankr_getTokenTransfers` |
+| `kiseki_getTransactionsByAddress` | `ankr_getTransactionsByAddress` |
+| `kiseki_getAccountBalance` | `ankr_getAccountBalance` |
+| `kiseki_getNFTsByOwner` | `ankr_getNFTsByOwner` |
+| `kiseki_getNFTMetadata` | `ankr_getNFTMetadata` |
+| `kiseki_getTokenPrice` | `ankr_getTokenPrice` |
+
+Coverage is derived, never configured: a `kiseki_*` method is advertised only
+when the upstream method behind it matches the instance's `methods:` list. If
+you narrow `methods:`, the canonical method disappears with it.
+
+**Two Ankr gotchas worth knowing before you copy the example config:**
+
+- Ankr serves its Advanced API (`ankr_*`) **only** on
+  `https://rpc.ankr.com/multichain/{key}`, and that endpoint rejects every node
+  method. The per-chain endpoint is the mirror image. One instance has one
+  `url_template`, so Ankr needs **two instances per chain** — see
+  `kiseki.yaml`. Give them different `provider:` values: that field is the
+  bucket-sharing identity, and mixing credit-metered and RPS-metered buckets
+  under one identity silently rebuilds the bucket.
+- An Advanced API call costs **700 API credits**, not 1. A bucket sized for RPS
+  is drained ~47× faster than by `eth_call`, so size the AAPI bucket in credits
+  or it will look permanently exhausted.
+
 ## Project layout
 
 ```
@@ -154,7 +191,8 @@ packages/
 ├── kiseki/            # main: HTTP server, auth, router, batch pipeline
 ├── upstream-core/     # the engine: adapter contract, ApikeyPool, buckets
 ├── upstream-generic/  # config-driven fallback provider
-└── upstream-alchemy/  # example thin provider (CU table + error signatures)
+├── upstream-alchemy/  # thin provider: CU table + error signatures
+└── upstream-ankr/     # thin provider: 700-credit AAPI + kiseki_* translations
 ```
 
 ## Docs

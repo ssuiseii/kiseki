@@ -17,6 +17,7 @@
 3. [Anatomi Package](#3-anatomi-package)
 4. [Tutorial: Membuat `upstream-ankr` dari Nol](#4-tutorial-membuat-upstream-ankr-dari-nol)
 5. [Referensi Lengkap: `AdapterHooks`](#5-referensi-lengkap-adapterhooks)
+   — termasuk [5.1 Melayani namespace kanonik `kiseki_*`](#51-melayani-namespace-kanonik-kiseki_)
 6. [Lapisan Cost](#6-lapisan-cost)
 7. [Signature Capability-Mismatch](#7-signature-capability-mismatch)
 8. [Testing](#8-testing)
@@ -75,7 +76,14 @@ Cek dulu daftar ini; kalau semuanya "tidak", providermu tidak butuh package baru
 
 Kalau **ya** untuk salah satunya → buat package tipis (tutorial di bawah).
 Kalau **semua tidak** → cukup pakai `package: generic` di config, selesai.
-Contoh nyata: `ankr-ethereum` di `kiseki.yaml` berjalan dengan `generic`.
+
+Contoh nyata keduanya ada di repo ini:
+
+- `ankr-ethereum-node` (node API Ankr) → cukup `package: generic`: tidak ada
+  cost khusus, tidak ada signature khusus.
+- `ankr-ethereum-aapi` (Advanced API Ankr) → `package: ankr`: 700 API
+  Credits/request, satu signature gate khas (`-32075`), dan tabel translasi
+  `kiseki_*`.
 
 > Catatan: mulailah dengan `generic` dulu. Buat package baru **hanya setelah**
 > kamu melihat error/perilaku provider yang tidak tertangani — jangan spekulatif.
@@ -258,8 +266,107 @@ export type AdapterHooks = {
 
   /** Seam test untuk weighted-random. Default Math.random. Jangan diisi di prod. */
   random?(): number
+
+  /**
+   * Tabel translasi namespace kanonik `kiseki_*` → method provider asli.
+   * Kosong/absen = package ini tidak melayani method kanonik (lihat §5.1).
+   */
+  translations?: readonly MethodTranslation[]
 }
 ```
+
+### 5.1 Melayani namespace kanonik `kiseki_*`
+
+Provider punya method non-standar sendiri (`ankr_*`, `alchemy_*`, …). Client
+sebaiknya cukup menghafal satu namespace netral: `kiseki_*`. Package provider
+menyuplai tabel translasi, engine yang menjalankan pemetaannya — router kiseki
+**tidak berubah sama sekali**.
+
+```ts
+import { parseCanonicalParams, tokenAmountFromRaw, type MethodTranslation } from "upstream-core"
+
+export const TRANSLATIONS: readonly MethodTranslation[] = [
+  {
+    canonical: "kiseki_getTokenTransfers",   // nama netral
+    upstream: "ankr_getTokenTransfers",      // method asli provider
+    // params kanonik → params provider. `undefined` = params client invalid.
+    mapRequest: (params, chain) => {
+      const parsed = parseCanonicalParams("kiseki_getTokenTransfers", params)
+      if (parsed === undefined) return undefined
+      const blockchain = CHAIN_ALIASES[chain]        // ethereum → eth
+      if (blockchain === undefined) return undefined  // jangan menebak
+      // Bentuk params upstream BEBAS: array posisional (node API) atau objek
+      // bernama (mis. Advanced API Ankr). Ikuti docs provider, bukan tebakan.
+      return { blockchain, address: parsed.address }
+    },
+    // result provider → result kanonik. Hanya respons sukses.
+    // `chain` = chain kiseki yang di-route (argumen ketiga), bukan tebakan dari
+    // payload: halaman kosong tidak punya field apa pun untuk ditebak.
+    mapResponse: (result, params, chain) => ({ /* …bentuk kanonik, sertakan `chain`… */ }),
+  },
+]
+
+export const createAdapter: AdapterFactory = (cfg, deps) =>
+  createPoolAdapter(cfg, deps, { costs: COSTS, translations: TRANSLATIONS })
+```
+
+Kaidah yang dijamin engine (jangan diduplikasi di package):
+
+| Perilaku | Siapa yang mengerjakan |
+|---|---|
+| `capability()` mencakup `kiseki_*` | otomatis, **hanya** kalau `upstream`-nya cocok pola `methods:` config |
+| Body request memakai method+params provider | engine, sebelum tiap attempt |
+| Cost memakai **nama upstream** (mis. `ankr_get*` = 700) | engine (`itemCost`) |
+| `mapRequest → undefined` = domain error final, tanpa fetch/regroup | engine |
+| Bentuk `params` upstream (array atau objek) diteruskan apa adanya | engine (`buildRequests`) |
+| Error provider **tidak** diterjemahkan (passthrough #36) | engine |
+| `mapResponse` throw = domain error final, tidak failover | engine |
+| Skema param/result kanonik (strict, Zod) | `upstream-core/src/namespace.ts` |
+| `chain` diteruskan ke `mapResponse` | engine (`pool.ts`, argumen ketiga) |
+
+Konsekuensi yang perlu disadari:
+
+- **Coverage = per (provider × plan).** Method kanonik hanya diiklankan kalau
+  method upstream-nya ada di `methods:`. Plan lebih rendah → kurangi entri
+  translasi (atau sempitkan `methods:`), core tak berubah.
+- **Pemetaan harus murni** — tanpa I/O, tanpa cache. `mapRequest`/`mapResponse`
+  dipanggil di jalur request.
+- **`mapRequest` boleh mengembalikan objek.** JSON-RPC 2.0 mengizinkan `params`
+  berupa array posisional ATAU objek bernama; engine meneruskannya verbatim.
+  Pakai bentuk yang **didokumentasikan provider** — jangan mengandalkan
+  toleransi server. (Ankr AAPI menerima array hari ini karena servernya
+  mengambil elemen pertama, tapi docs-nya mendokumentasikan objek.)
+- **Hati-hati batas `pageSize` provider.** Kalau batas provider LEBIH KECIL dari
+  maksimum kanonik (1000), tolak di `mapRequest` (`return undefined`) — jangan
+  di-clamp diam-diam. Clamp mengubah makna permintaan client, dan percobaan yang
+  pasti gagal tetap dibayar penuh (Ankr: 700 kredit). Contoh:
+  `ankr_getNFTsByOwner` maks 50.
+- **Jangan memakai `number` JS untuk nilai Wei.** Pakai `tokenAmountFromRaw(hex)`
+  → `{ value, valueRaw }` (string desimal + hex asli). Kalau provider memberi
+  integer **desimal** (bukan hex), konversi sendiri ke hex untuk `valueRaw` —
+  jangan tempelkan angka desimal ke field bernama "hex".
+- **`mapResponse` menerima `chain` sebagai argumen ketiga.** Semua skema hasil
+  kanonik mewajibkan field `chain`, sedangkan payload provider sering tidak
+  memuatnya (dan halaman kosong tidak memuat apa pun). Jangan menebak chain dari
+  payload; pakai argumen itu.
+- `transport: "http"` (REST) **belum diimplementasi**: entri seperti itu tidak
+  diiklankan di `capability()`. Hanya `"jsonrpc"` (default) yang jalan.
+
+**Contoh nyata: `upstream-ankr`** (baca ini sebelum menulis translasimu
+sendiri — beberapa jebakannya tidak terduga):
+
+- `kiseki_getNFTsByOwner` → `ankr_getNFTsByOwner` butuh `filter` berbentuk
+  **array** `[{ "<contract>": [] }]`. Object polos ditolak `-32602`.
+- Ankr mengembalikan `valueRawInteger` sebagai **desimal**; `valueRaw` kanonik
+  harus hex. Selain itu field `value` Ankr terbukti bisa tidak konsisten dengan
+  `valueRawInteger`-nya, jadi nilai kanonik diturunkan dari raw + decimals.
+- `timestamp` Ankr = unix detik (kadang hex string); kanonik = ISO-8601.
+- Nama chain Ankr (`eth`) berbeda dari nama kiseki (`ethereum`) — itulah satu-
+  satunya alasan `ANKR_CHAIN_ALIASES` ada.
+
+**Jangan menulis translasi dari ingatan.** Baca dokumen per metode, lalu rekam
+bentuk respons nyata sebelum menulis `mapResponse` (lihat
+`plan/notes-m0.md` sebagai contoh catatan lapangan).
 
 Dua tipe penunjang yang mungkin kamu butuhkan:
 
@@ -449,17 +556,16 @@ teregister → error startup (bukan silent fallback).
 chains:
   ethereum:
     upstreams:
-      - name: ankr-ethereum
-        provider: ankr                  # identitas sharing bucket (§5.4)
-        package: ankr                   # ← baru ini yang berubah dari "generic"
-        url_template: "https://rpc.ankr.com/eth/{apikey}"
+      - name: ankr-ethereum-aapi
+        provider: ankr-aapi             # identitas sharing bucket (§5.4)
+        package: ankr                   # ← adapter yang membangun instance ini
+        url_template: "https://rpc.ankr.com/multichain/{apikey}"
         apikeys:
           - token: "${ANKR_KEY}"
             label: main
             buckets:
-              - { capacity: 15,  refill_per_second: 15 }    # RPS
-              - { capacity: 600, refill_per_second: 10 }    # RPM
-        methods: ["eth_*"]
+              - { capacity: 1200, refill_per_second: 1200 }  # API credits
+        methods: ["ankr_*"]             # kiseki_* OTOMATIS dari tabel translasi
         archive: false
 ```
 
@@ -468,6 +574,15 @@ Ingat semantik dua field identitas:
 - `provider:` = kunci sharing bucket lintas chain (#24) — apikey sama di dua
   chain dengan `provider` sama = satu bucket bersama.
 - `package:` = adapter mana yang membangun instance ini (§9.1).
+
+> ⚠️ **Jangan menyatukan dua API berbeda di satu instance.** Satu instance
+> hanya punya satu `url_template`, dan provider bisa melayani namespace berbeda
+> di endpoint berbeda (Ankr: `ankr_*` hanya di `/multichain/`, `eth_*` hanya di
+> `/eth/`, masing-masing `-32601` untuk method yang lain). Pakai **dua instance**
+> dengan `provider` yang **berbeda**: provider adalah identitas bucket, dan dua
+> set bucket dengan satuan berbeda (kredit vs RPS) di satu identitas akan
+> saling menimpa — `BucketRegistry.get` membangun ulang bucket saat jumlah
+> bucket berubah, dan kredit yang sudah terpakai hilang tanpa peringatan.
 
 ### 9.3 Verifikasi akhir
 
@@ -495,6 +610,14 @@ statis) atau regroup ke upstream lain (runtime, #34).
       bisa menelan domain error
 - [ ] Test: cost + signature (+ quirks bila ada) dengan harness injeksi §8;
       `bun test` hijau penuh
+- [ ] Bila melayani `kiseki_*` (§5.1): `translations` diisi, `mapRequest`/`mapResponse`
+      murni, validasi lewat `parseCanonicalParams`, `mapResponse` memakai argumen
+      `chain` (bukan menebak dari payload), dan `methods:` memuat pola method
+      upstream-nya (kalau tidak, canonical-nya tidak akan pernah diiklankan)
+- [ ] `mapResponse` diverifikasi terhadap respons provider **nyata** (fixture di
+      test berasal dari panggilan sungguhan), bukan dari ingatan/dokumen saja
+- [ ] Contoh config: satu instance = satu endpoint; jangan mencampur dua
+      namespace provider yang dilayani endpoint berbeda (§9.2)
 - [ ] Tidak ada token apikey yang di-log / ditulis / di-echo di manapun (§11)
 - [ ] Contoh config di `kiseki.yaml` (atau docs) memakai `${VAR}`, bukan token mentah
 - [ ] Dokumen desain tak tersentuh; kalau ada kebutuhan di luar kontrak
@@ -515,3 +638,7 @@ statis) atau regroup ke upstream lain (runtime, #34).
    `upstream-core`; tidak boleh meng-import `kiseki` atau package provider lain.
 6. **Config statis adalah sumber capability** — runtime matcher hanya
    koreksi; jangan pakai untuk "menebak" capability saat startup.
+7. **Translasi kanonik tidak boleh menyentuh error provider** — `mapResponse`
+   hanya untuk respons sukses; error tetap passthrough verbatim (#36). Dan
+   `mapRequest → undefined` berarti params client invalid, **bukan** capability
+   mismatch: jangan pernah memaksakan regroup untuk kasus itu.
