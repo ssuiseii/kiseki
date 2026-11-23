@@ -81,6 +81,24 @@ research-notes/ ──▶ proposed/ ──▶ implemented/
 5. **Reject.** A proposal that will not be implemented is moved to `rejected/`
    with the reason for rejection. Do not delete it.
 
+### Status
+
+Every proposal carries a `Status` row in its metadata table. The value is
+written in Indonesian, because the proposals themselves are written in
+Indonesian. It follows the folder the proposal lives in and the
+`_partial-implemented` suffix:
+
+| Where the proposal is | Status value |
+|---|---|
+| `proposed/`, no suffix | `Diajukan untuk review` |
+| `proposed/`, `_partial-implemented` suffix | `Diimplementasikan sebagian` |
+| `implemented/` | `Diimplementasikan` |
+| `rejected/` | `Ditolak` |
+
+Update the value in the same step that moves or renames the file, so the table
+never contradicts the folder. It is the only metadata row that changes on a
+move; the date never does.
+
 ---
 
 ## `research-notes/`
@@ -206,4 +224,5 @@ instead of deleting them.
 
 - A rejected proposal **must state why it was rejected**. Add a rejection
   section (in Indonesian) at the top of the document, directly below the
-  metadata table, and set the status in the metadata table to rejected.
+  metadata table, and set the status in the metadata table to `Ditolak` (see
+  [Status](#status)).

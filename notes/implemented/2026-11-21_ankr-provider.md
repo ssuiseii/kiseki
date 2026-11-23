@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Jenis** | Proposal desain |
-| **Status** | Diajukan untuk review |
+| **Status** | Diimplementasikan |
 | **Tanggal** | 22 November 2026 |
 | **Komponen** | `upstream-ankr` (baru), `upstream-core` (perubahan kontrak kecil), registry provider, konfigurasi |
 | **Prasyarat** | Proposal *Namespace Kanonik `kiseki_*`* |

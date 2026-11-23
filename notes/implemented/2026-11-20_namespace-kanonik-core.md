@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Jenis** | Proposal desain |
-| **Status** | Diajukan untuk review |
+| **Status** | Diimplementasikan |
 | **Tanggal** | 21 November 2026 |
 | **Komponen** | `upstream-core` |
 | **Proposal lanjutan** | Integrasi Ankr Advanced API (bergantung pada proposal ini) |

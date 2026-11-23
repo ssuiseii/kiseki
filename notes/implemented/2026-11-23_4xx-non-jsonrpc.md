@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Jenis** | Proposal desain |
-| **Status** | Diajukan untuk review |
+| **Status** | Diimplementasikan |
 | **Tanggal** | 23 November 2026 |
 | **Komponen** | `upstream-core` (klasifikasi respons, ApiKeyState, ApikeyPool, kontrak adapter, taksonomi outcome), `kiseki` (router, tabel kode error), dokumentasi arsitektur |
 | **Prasyarat** | Tidak ada |
