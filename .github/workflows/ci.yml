@@ -1,0 +1,147 @@
+# CI for the Kiseki monorepo.
+#
+# Three jobs, deliberately ordered by cost: `check` is the gate (typecheck + the
+# whole test suite), `build` proves the compiled binary still links, and `e2e`
+# re-runs the boundary suites on a second OS so a platform-specific failure
+# (path handling, process spawning, socket binding) cannot hide.
+#
+# Every test runs WITHOUT network access and WITHOUT secrets: fetch, clock and
+# randomness are injected, and the compiled-binary suite spawns its own mock
+# upstream on 127.0.0.1. No repository secret is needed for any job.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to the same branch cancels the previous run: CI minutes should not
+# be spent proving a commit that has already been superseded.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Bun is fast; a hung test is a bug, not a slow machine. This bounds the damage.
+  BUN_INSTALL_CACHE_DIR: ${{ github.workspace }}/.bun-cache
+
+jobs:
+  check:
+    name: Typecheck & test (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun install cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUN_INSTALL_CACHE_DIR }}
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      # --frozen-lockfile: a CI install must not silently resolve a different
+      # dependency tree than the one that was committed and tested.
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck (all packages)
+        run: bun run typecheck
+
+      - name: Test (all packages)
+        run: bun test packages
+
+  build:
+    name: Build binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun install cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUN_INSTALL_CACHE_DIR }}
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The binary is the shipped artifact (design.md §21). If it does not link,
+      # nothing else about the release matters.
+      - name: Compile
+        run: bun run build
+
+      - name: Smoke-test the binary
+        run: |
+          test -x packages/kiseki/dist/kiseki || {
+            echo "::error::bun run build did not produce an executable at packages/kiseki/dist/kiseki"
+            exit 1
+          }
+          packages/kiseki/dist/kiseki --help
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiseki-linux-x64
+          path: packages/kiseki/dist/kiseki
+          if-no-files-found: error
+          retention-days: 7
+
+  # The boundary suites spawn processes and bind sockets, which is where
+  # platform assumptions surface. Running them on a second OS is cheap insurance
+  # against a Linux-only CI that hides a macOS regression.
+  e2e:
+    name: Boundary suites (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun install cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUN_INSTALL_CACHE_DIR }}
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # These four files are the ones that cross a real boundary: the server
+      # (Hono), the pipeline, the compiled binary, and the Ankr provider split.
+      - name: Server + pipeline + Ankr e2e
+        run: |
+          bun test \
+            packages/kiseki/test/e2e.test.ts \
+            packages/kiseki/test/ankr-e2e.test.ts \
+            packages/kiseki/test/ankr-integration.test.ts
+
+      - name: Compiled binary e2e
+        run: bun test packages/kiseki/test/binary.test.ts

@@ -9,7 +9,7 @@
     "test": "bun test packages",
     "test:core": "bun test packages/upstream-core",
     "test:kiseki": "bun test packages/kiseki",
-    "typecheck": "tsc --noEmit -p packages/upstream-core/tsconfig.json && tsc --noEmit -p packages/upstream-generic/tsconfig.json && tsc --noEmit -p packages/upstream-alchemy/tsconfig.json && tsc --noEmit -p packages/kiseki/tsconfig.json",
+    "typecheck": "tsc --noEmit -p packages/upstream-core/tsconfig.json && tsc --noEmit -p packages/upstream-generic/tsconfig.json && tsc --noEmit -p packages/upstream-alchemy/tsconfig.json && tsc --noEmit -p packages/upstream-ankr/tsconfig.json && tsc --noEmit -p packages/kiseki/tsconfig.json",
     "build": "bun run --filter kiseki build",
     "check": "bun run typecheck && bun test packages"
   },

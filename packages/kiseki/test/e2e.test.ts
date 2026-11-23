@@ -434,3 +434,67 @@ describe("e2e — a reload behind a live server (§19)", () => {
     expect(result.runtime.notes.hasMethodNote("alchemy-ethereum", "trace_block")).toBe(false)
   })
 })
+
+describe("e2e — a rejected apikey is a configuration problem, not capacity", () => {
+  /** Ankr research note, section "apikey salah", quoted verbatim. */
+  const ANKR_HTML_404 =
+    "<html><head><title>404 Not Found</title></head>\n<body><center><h1>404 Not Found</h1></center><hr><center>nginx</center></body></html>"
+
+  const html404 = (): Response =>
+    new Response(ANKR_HTML_404, { status: 404, headers: { "content-type": "text/html" } })
+
+  test("the client gets 200 / -32008, and the metrics show the new label", async () => {
+    const { post, scrape } = stack({ responder: () => html404() })
+
+    const response = await post("/ethereum/client-main", {
+      id: 1,
+      method: "eth_blockNumber",
+      params: [],
+    })
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get("retry-after")).toBeNull()
+    const body = (await response.json()) as { error: { code: number; message: string; data?: unknown } }
+    expect(body.error).toEqual({
+      code: -32008,
+      message: "upstream is misconfigured",
+      data: { status: 404 },
+    })
+
+    const text = await scrape()
+    // Level 2 sees the rejection on the key; level 1 sees the instance diagnosis.
+    expect(text).toContain('kiseki_pool_key_attempts_total{upstream="alchemy-ethereum",apikey="a",outcome="misconfigured"} 1')
+    expect(text).toContain('kiseki_upstream_attempts_total{upstream="alchemy-ethereum",outcome="misconfigured"} 1')
+    // Not a fail-fast: nothing was starved.
+    expect(text).not.toContain("kiseki_failfast_total{chain=\"ethereum\"")
+    // The key is visibly rested, which is the operator's other signal.
+    expect(text).toContain("kiseki_apikey_cooldown_seconds_remaining{provider=\"alchemy\",apikey=\"")
+  })
+
+  test("a second request during the cooldown never reaches the upstream", async () => {
+    let calls = 0
+    const { post } = stack({
+      responder: () => {
+        calls += 1
+        return html404()
+      },
+    })
+
+    await post("/ethereum/client-main", { id: 1, method: "eth_blockNumber", params: [] })
+    const first = calls
+    const second = await post("/ethereum/client-main", { id: 2, method: "eth_blockNumber", params: [] })
+
+    expect(calls).toBe(first)
+    expect(second.status).toBe(200)
+    const body = (await second.json()) as { error: { code: number } }
+    expect(body.error.code).toBe(-32008)
+  })
+
+  test("the scrape never leaks the token, only labels", async () => {
+    const { post, scrape } = stack({ responder: () => html404() })
+    await post("/ethereum/client-main", { id: 1, method: "eth_blockNumber", params: [] })
+    const text = await scrape()
+    expect(text).not.toContain("alchemy-a")
+    expect(text).not.toContain("alchemy-b")
+  })
+})

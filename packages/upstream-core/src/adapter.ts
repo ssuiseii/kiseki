@@ -7,7 +7,6 @@
  */
 
 import type { BucketRegistry } from "./bucket"
-import type { CapabilityErrorMatcher } from "./capsig"
 import type { CostTable } from "./cost"
 // Type-only, so the adapter↔pool cycle is erased at build time.
 import type { PoolObserver } from "./pool"
@@ -43,6 +42,17 @@ export type CoreDeps = {
   poolObserver?: PoolObserver
 }
 
+/**
+ * An active configuration diagnosis: every apikey of the instance was rejected
+ * by the gateway and is cooling down for that reason.
+ */
+export type MisconfiguredState = {
+  /** Epoch ms when the first key of the instance could serve again. */
+  untilMs: number
+  /** HTTP status of the last rejection, when the provider reported one. */
+  status?: number
+}
+
 export interface UpstreamAdapter {
   /** Instance name from config (unique globally, design.md §15.1 rule 3). */
   readonly name: string
@@ -54,6 +64,13 @@ export interface UpstreamAdapter {
   weight(): number
   /** Epoch ms when the first apikey could serve again; for Retry-After (§12.2). */
   earliestReadyAt(): number
+  /**
+   * Configuration diagnosis derived from key state, or undefined when the
+   * instance is not misconfigured. Read-only scalar: the router uses it to skip a
+   * doomed instance instead of paying quota for a request that is certain to be
+   * rejected (see "Kesehatan dua level" in ARCHITECTURE.md).
+   */
+  misconfigured(): MisconfiguredState | undefined
   attempt(group: Group, ctx: AttemptCtx): Promise<UpstreamOutcome>
 }
 
@@ -88,16 +105,9 @@ export type AdapterFactory = (
   deps: CoreDeps,
 ) => UpstreamAdapter
 
-/** Everything a provider package may need to customize. */
-export type ProviderHooks = {
-  /** Provider error signature, on top of the generic fallback (§8.3). */
-  matchCapabilityError?: CapabilityErrorMatcher
-  /** Cost override table: provider-specific units (§5.3). */
-  costs?: Record<string, number>
-  /** Headers added to every request (provider quirks). */
-  headers?: (token: string) => Record<string, string>
-  /** Providers that bill per HTTP call rather than per item (§5.5 rule 2). */
-  countsBatchAsOne?: boolean
-  /** Default per-instance timeout, overridable by config. */
-  defaultTimeoutMs?: number
-}
+/**
+ * Everything a provider package may customize lives in `AdapterHooks` (`pool.ts`),
+ * next to the engine that consumes it — this file used to carry a parallel
+ * `ProviderHooks` type with drifting field names, which nothing read. One hook
+ * type, one definition, no drift.
+ */

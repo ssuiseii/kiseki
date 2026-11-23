@@ -714,3 +714,186 @@ describe("logging (§18.2)", () => {
     expect(outcomes).toHaveLength(2)
   })
 })
+
+describe("misconfiguration is a diagnosis, not a health signal (Validasi #6, #7)", () => {
+  const diagnosis = (status?: number) =>
+    status === undefined ? { untilMs: 1_000 } : { untilMs: 1_000, status }
+
+  test("a misconfigured upstream is skipped: no attempt, no quota, not marked tried", async () => {
+    const broken = fakeAdapter({
+      name: "broken",
+      weight: 0,
+      misconfigured: diagnosis(404),
+      outcomes: [successOutcome(0, "0xwrong")],
+    })
+    const healthy = fakeAdapter({ name: "healthy", weight: 1, outcomes: [successOutcome(0, "0x1")] })
+
+    const outcomes = await route(deps([broken.view, healthy.view], { random: () => 0 }), [state(0)])
+
+    expect(broken.calls).toHaveLength(0)
+    expect(healthy.calls).toHaveLength(1)
+    expect(outcomes[0]!.ok).toBe(true)
+  })
+
+  test("every candidate misconfigured and no attempt → -32008 with the status, no estimate", async () => {
+    const broken = fakeAdapter({ name: "broken", weight: 0, misconfigured: diagnosis(404) })
+    const alsoBroken = fakeAdapter({ name: "also", weight: 0, misconfigured: diagnosis(401) })
+
+    const outcomes = await route(
+      deps([broken.view, alsoBroken.view], { random: () => 0 }),
+      [state(0)],
+    )
+
+    expect(broken.calls).toHaveLength(0)
+    expect(alsoBroken.calls).toHaveLength(0)
+    expect(outcomes[0]!.error?.code).toBe(-32008)
+    expect(outcomes[0]!.error?.message).toBe("upstream is misconfigured")
+    expect(outcomes[0]!.error?.data).toEqual({ status: 404 })
+    // Never a capacity answer: no 429, no Retry-After.
+    expect(outcomes[0]!.capacity).toBeUndefined()
+    expect(outcomes[0]!.retryAfterMs).toBeUndefined()
+  })
+
+  test("the passive finalisation adds no attempt counter", async () => {
+    const attempts: string[] = []
+    const broken = fakeAdapter({ name: "broken", weight: 0, misconfigured: diagnosis(404) })
+    const outcomes = await route(
+      deps([broken.view], {
+        random: () => 0,
+        observer: { onAttempt: (upstream) => attempts.push(upstream) },
+      }),
+      [state(0)],
+    )
+    expect(attempts).toEqual([])
+    expect(outcomes[0]!.error?.code).toBe(-32008)
+  })
+
+  test("a misconfigured outcome moves to the next candidate and does not park anything", async () => {
+    const broken = fakeAdapter({
+      name: "broken",
+      outcomes: [{ kind: "misconfigured", status: 404 }],
+    })
+    const healthy = fakeAdapter({ name: "healthy", outcomes: [successOutcome(0, "0x1")] })
+
+    const outcomes = await route(deps([broken.view, healthy.view], { random: () => 0 }), [state(0)])
+
+    expect(broken.calls).toHaveLength(1)
+    expect(healthy.calls).toHaveLength(1)
+    expect(outcomes[0]!.ok).toBe(true)
+  })
+
+  test("misconfigured followed by rate_limited is -32005, the honest answer", async () => {
+    // The item is not proven impossible: only one upstream is misconfigured, and
+    // the other is merely starved.
+    // A real pool reports `misconfigured()` once the rejected key has cooled down,
+    // so the fake does too — otherwise the estimate below would count its recovery.
+    const broken = fakeAdapter({
+      name: "broken",
+      misconfigured: diagnosis(404),
+      outcomes: [{ kind: "misconfigured", status: 404 }],
+    })
+    const starved = fakeAdapter({
+      name: "starved",
+      earliestReadyAt: 4_000,
+      outcomes: [{ kind: "rate_limited", retryAtMs: 4_000 }],
+    })
+
+    const outcomes = await route(
+      deps([broken.view, starved.view], { random: () => 0, now: () => 0 }),
+      [state(0)],
+    )
+
+    expect(outcomes[0]!.error?.code).toBe(-32005)
+    expect(outcomes[0]!.capacity).toBe("rate_limited")
+    expect(outcomes[0]!.retryAfterMs).toBe(4_000)
+  })
+
+  test("the estimate never uses a misconfigured upstream's cooldown", async () => {
+    // A is misconfigured and cooling down for 30s; B is starved but recovering in
+    // 2s. Waiting does not cure A, so the estimate must come from B alone.
+    const broken = fakeAdapter({
+      name: "broken",
+      weight: 0,
+      earliestReadyAt: 30_000,
+      misconfigured: { untilMs: 30_000, status: 404 },
+    })
+    const starved = fakeAdapter({
+      name: "starved",
+      earliestReadyAt: 2_000,
+      outcomes: [{ kind: "rate_limited", retryAtMs: 2_000 }],
+    })
+
+    const outcomes = await route(
+      deps([broken.view, starved.view], { random: () => 0, now: () => 0 }),
+      [state(0)],
+    )
+
+    expect(outcomes[0]!.error?.code).toBe(-32005)
+    expect(outcomes[0]!.retryAfterMs).toBe(2_000)
+  })
+
+  test("a misconfigured upstream and a starved one: not all-misconfigured → -32005", async () => {
+    const broken = fakeAdapter({ name: "broken", weight: 0, misconfigured: diagnosis(404) })
+    const starved = fakeAdapter({
+      name: "starved",
+      weight: 0,
+      earliestReadyAt: 3_000,
+      misconfigured: undefined,
+    })
+
+    const outcomes = await route(
+      deps([broken.view, starved.view], { random: () => 0, now: () => 0 }),
+      [state(0)],
+    )
+
+    expect(outcomes[0]!.error?.code).toBe(-32005)
+    expect(outcomes[0]!.capacity).toBe("rate_limited")
+  })
+
+  test("a misconfigured adapter does not hijack a healthy upstream's answer", async () => {
+    // Both have weight; the pick must not change just because one is diagnosed.
+    const broken = fakeAdapter({ name: "broken", weight: 1, misconfigured: diagnosis(404) })
+    const healthy = fakeAdapter({ name: "healthy", weight: 1, outcomes: [successOutcome(0, "0x2")] })
+
+    const outcomes = await route(deps([broken.view, healthy.view], { random: () => 0 }), [state(0)])
+
+    expect(broken.calls).toHaveLength(0)
+    expect(outcomes[0]!.ok).toBe(true)
+    if (outcomes[0]!.ok) expect(outcomes[0]!.result).toBe("0x2")
+  })
+
+  test("a sick outcome still wins over a passive misconfiguration", async () => {
+    const sick = fakeAdapter({
+      name: "sick",
+      earliestReadyAt: 1_000,
+      outcomes: [{ kind: "sick", retryAtMs: 1_000 }],
+    })
+    const broken = fakeAdapter({ name: "broken", weight: 0, misconfigured: diagnosis(404) })
+
+    const outcomes = await route(
+      deps([sick.view, broken.view], { random: () => 0, now: () => 0 }),
+      [state(0)],
+    )
+
+    expect(outcomes[0]!.error?.code).toBe(-32006)
+    expect(outcomes[0]!.capacity).toBe("sick")
+  })
+
+  test("sendRaw during a passive diagnosis is -32008 without any fetch", async () => {
+    const broken = fakeAdapter({ name: "broken", weight: 0, misconfigured: diagnosis(404) })
+    const sendRawState: ItemState = {
+      request: item(0, "eth_sendRawTransaction", ["0xdeadbeef"]),
+      classified: classification({
+        method: "eth_sendRawTransaction",
+        idempotency: "NON_IDEMPOTENT",
+      }),
+      tried: new Set(),
+      mismatched: new Set(),
+    }
+
+    const outcomes = await route(deps([broken.view], { random: () => 0 }), [sendRawState])
+
+    expect(broken.calls).toHaveLength(0)
+    expect(outcomes[0]!.error?.code).toBe(-32008)
+  })
+})

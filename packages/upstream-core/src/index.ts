@@ -27,14 +27,38 @@ export type {
   AdapterFactory,
   Capability,
   CoreDeps,
-  ProviderHooks,
+  MisconfiguredState,
   UpstreamAdapter,
   UpstreamInstanceConfig,
 } from "./adapter"
 
+export type {
+  CanonicalMethod,
+  CanonicalParamsOf,
+  CanonicalResultOf,
+  MethodTranslation,
+  NamespaceHooks,
+  TokenAmount,
+} from "./namespace"
+export {
+  CANONICAL_METHODS,
+  ERROR_INTERNAL,
+  ERROR_INVALID_PARAMS,
+  canonicalMappingFailed,
+  canonicalSchemas,
+  canonicalTransportUnsupported,
+  coveredCanonicalMethods,
+  invalidCanonicalParams,
+  isCanonicalMethod,
+  parseCanonicalParams,
+  parseCanonicalResult,
+  tokenAmountFromRaw,
+  tokenAmountSchema,
+} from "./namespace"
+
 export { AdapterRegistry } from "./registry"
 
-export type { Bucket, BucketSpec, KeyHealth } from "./bucket"
+export type { Bucket, BucketSpec, CooldownReason, KeyHealth } from "./bucket"
 export { ApiKeyState, BucketRegistry, identityKey } from "./bucket"
 
 export type { CapabilityCap, CapabilityErrorMatcher } from "./capsig"
@@ -64,7 +88,7 @@ export {
   verdictToEntry,
 } from "./result"
 
-export type { AdapterHooks, ApikeyPoolOptions, PoolKey, PoolObserver } from "./pool"
+export type { AdapterHooks, ApikeyPoolOptions, OutboundItem, PoolKey, PoolObserver } from "./pool"
 export { ApikeyPool, buildBody, createPoolAdapter } from "./pool"
 
 export {

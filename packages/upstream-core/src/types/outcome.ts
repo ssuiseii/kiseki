@@ -33,5 +33,12 @@ export type UpstreamOutcome =
   | { kind: "unsupported"; items: UnsupportedItem[] }
   | { kind: "rate_limited"; retryAtMs: number }
   | { kind: "sick"; retryAtMs: number }
+  /**
+   * Every apikey of this instance is cooling down because the gateway rejected it
+   * (401/403, or a 4xx that was not a JSON-RPC answer). That is a configuration
+   * problem, not capacity and not health: the router moves on without parking the
+   * provider, and answers `-32008` when nothing else is left.
+   */
+  | { kind: "misconfigured"; status?: number }
   /** Broadcast state unknown (sendRaw). Stops BOTH levels (design.md §11.3). */
   | { kind: "ambiguous" }

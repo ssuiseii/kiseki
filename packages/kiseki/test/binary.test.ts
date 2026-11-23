@@ -254,8 +254,18 @@ describe("M5 — the compiled binary", () => {
   test("is a standalone executable, not a script that needs bun", () => {
     if (buildError !== undefined) throw new Error(`build failed:\n${buildError}`)
     const head = readFileSync(binaryPath).subarray(0, 4)
-    // ELF magic: a real single-file binary (design.md §21 "tanpa runtime dependency").
-    expect([...head]).toEqual([0x7f, 0x45, 0x4c, 0x46])
+
+    // A real single-file binary (design.md §21 "tanpa runtime dependency"), not a
+    // JS payload. The magic number is platform-specific, so assert the one that
+    // matches THIS platform — hardcoding ELF made the test fail on macOS, where
+    // Bun emits Mach-O. A shebang here would mean a script, not a binary.
+    const MAGIC: Record<string, number[]> = {
+      linux: [0x7f, 0x45, 0x4c, 0x46], // \x7fELF
+      darwin: [0xcf, 0xfa, 0xed, 0xfe], // Mach-O 64-bit, little endian
+    }
+    const expected = MAGIC[process.platform]
+    expect(expected).toBeDefined() // an unknown platform must fail loudly, not skip
+    expect([...head]).toEqual(expected!)
   })
 
   test("--check validates a config and exits 0 without binding a socket", async () => {

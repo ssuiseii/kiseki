@@ -27,6 +27,11 @@ export type FakeAdapterOptions = {
   weight?: number
   earliestReadyAt?: number
   /**
+   * Configuration diagnosis the adapter reports. Absent = not misconfigured, which
+   * is what every other test wants. A test that needs the signal injects it here.
+   */
+  misconfigured?: { untilMs: number; status?: number }
+  /**
    * Outcomes replayed in order; the last one repeats. Optional: an adapter that
    * only needs to report capability (pre-flight tests) never gets called, and one
    * driven by `onAttempt` ignores the list.
@@ -55,6 +60,7 @@ export const fakeAdapter = (options: FakeAdapterOptions): FakeAdapter => {
     }),
     weight: () => options.weight ?? 1,
     earliestReadyAt: () => options.earliestReadyAt ?? 0,
+    misconfigured: () => options.misconfigured,
     attempt: async (group: Group, ctx: AttemptCtx): Promise<UpstreamOutcome> => {
       calls.push({ group, attempt: ctx.attempt })
       if (options.onAttempt !== undefined) return options.onAttempt(group, ctx)

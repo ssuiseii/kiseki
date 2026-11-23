@@ -1,5 +1,5 @@
 /**
- * `upstream-alchemy` — the thin provider package for Alchemy (design.md §7.3).
+ * `upstream-alchemy` — the thin provider package for Alchemy.
  *
  * Everything genuinely provider-specific about Alchemy lives here and nowhere
  * else:
@@ -13,8 +13,12 @@
  * Source for the CU numbers: Alchemy's published compute unit cost table
  * (https://www.alchemy.com/docs/reference/compute-unit-costs), read 2026-11-21.
  * They are defaults, not truth: an instance's config `costs:` always overrides
- * them (design.md §5.3), which is the documented escape hatch when the table
- * changes (design.md §23 risk #8).
+ * them (ARCHITECTURE.md, "5. Model kuota dan cost"), which is the documented
+ * escape hatch when the table changes.
+ *
+ * Error-signature facts below are verbatim from live Alchemy responses, recorded
+ * in `notes/research-notes/alchemy-provider.md` (§3, §5, §6). Never invent a
+ * provider message: copy it from that note and write the pattern against it.
  */
 
 import {
@@ -125,21 +129,61 @@ export const ALCHEMY_CU: CostTable = {
 }
 
 /**
- * Alchemy error signatures on top of the generic table (design.md §8.3).
+ * Alchemy error signatures on top of the generic table (ARCHITECTURE.md,
+ * "6.2 Sinyal mismatch kapabilitas").
  *
- *  - A method gated by plan arrives as `-32601` or as a "paid plan" message; both
- *    prove the instance cannot serve it, so both are `method` mismatches.
- *  - Alchemy's "state at block #N is pruned" / "lowest height is" wording is
- *    already covered by the generic archive patterns.
- *  - Everything else (nonce too low, execution reverted, …) is a domain answer
- *    and must be forwarded untouched (#36), so we return null and let the
- *    fallback table have the final say.
+ * Facts from `notes/research-notes/alchemy-provider.md` (§3, §5, §6):
+ *
+ *  - Alchemy rejects methods it cannot serve with code `-32600` — NOT `-32601`,
+ *    so `isMethodNotFound` alone never catches them. `-32600` does not prove the
+ *    method is unavailable: Alchemy uses it for several different failures, so
+ *    the matcher has to read the message content and cannot decide on the code
+ *    alone. A wrong apikey is one of those cases — it answers HTTP 401 with
+ *    `-32600` and "Must be authenticated!", but a 401 is classified as
+ *    `unauthorized` in upstream-core before any matcher runs, so that message
+ *    never reaches this function.
+ *  - A rejection that proves the method does not exist on this instance
+ *    ("Unsupported method: …", "… is not available on the <NETWORK>", the
+ *    Free-tier "… is not available on the Free tier …") is a `method` mismatch
+ *    → runtime note + regroup, so the instance is not retried forever.
+ *  - The `eth_getLogs` 10-block-range message also says "Free tier" and "PAYG",
+ *    but it is a request-shape limit, not a method refusal: a runtime note is
+ *    per method per instance, so matching it as `method` would wrongly route
+ *    every future eth_getLogs — including small ranges — away from Alchemy.
+ *    It must yield null (final passthrough / generic fallback decides).
+ *  - Domain answers (nonce too low, execution reverted, insufficient funds, …)
+ *    are never mismatches: null → untouched passthrough (ARCHITECTURE.md,
+ *    "6. Penanganan error").
  */
-const PLAN_GATED_PATTERN = /(?:not available on (?:the )?free plan|paid plan|upgrade to (?:a )?paid)/
+
+/**
+ * Free-tier method refusal, e.g. trace_* and debug_* on a Free tier account
+ * ("trace_block is not available on the Free tier - upgrade to Pay As You Go,
+ * or Enterprise for access."). Anchored on the message content, not the code.
+ */
+const FREE_TIER_METHOD_PATTERN = / is not available on the free tier/
+
+/**
+ * Method refusal naming the network, e.g. "Unsupported method: eth_coinbase on
+ * ETH_MAINNET" and "net_peerCount is not available on the ETH_MAINNET..." (the
+ * note records that message truncated, so the match is not end-anchored).
+ * Requiring the underscore-shaped network token keeps it conservative; a bare
+ * "not available" without it stays null.
+ */
+const UNSUPPORTED_METHOD_PATTERN =
+  /(?:unsupported method: .+|is not available) on (?:the )?[a-z]+_[a-z]+/
 
 export const matchAlchemyCapability: CapabilityErrorMatcher = (error) => {
   if (isMethodNotFound(error)) return "method"
-  if (PLAN_GATED_PATTERN.test(error.message.toLowerCase())) return "method"
+  const message = error.message.toLowerCase()
+  // Match on message content: -32600 alone proves nothing about the method, so
+  // the code by itself is not enough (see the block comment above).
+  if (error.code === -32600) {
+    if (FREE_TIER_METHOD_PATTERN.test(message)) return "method"
+    if (UNSUPPORTED_METHOD_PATTERN.test(message)) return "method"
+    // Not a method refusal → not mine.
+    return null
+  }
   // No Alchemy-specific archive signature beyond the generic ones; returning null
   // means "not mine", and composeMatchers then runs the generic table.
   return null

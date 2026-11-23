@@ -898,6 +898,113 @@ describe("createPoolAdapter", () => {
     await adapter.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
     expect(registry.peek("alchemy", "KEY_A")!.credits(0)).toEqual([96])
   })
+
+  // The canonical namespace is additive: an adapter built without `translations`
+  // must behave exactly as it did before it existed (plan A §4.1).
+  test("without translations the capability is the configured one, byte for byte", () => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const adapter = createPoolAdapter(cfg, {
+      bucketRegistry: registry,
+      logger: silentLogger,
+      now: clock.now,
+    })
+    expect(adapter.capability()).toEqual({ methods: ["eth_*", "trace_*"], archive: true })
+  })
+
+  test("the quota of a canonical item is charged under its upstream name", async () => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl, calls } = makeFetch([
+      { kind: "json", body: okResult(0, { ok: true }) },
+    ])
+    const adapter = createPoolAdapter(
+      { ...cfg, methods: ["eth_*", "trace_*", "alchemy_*"] },
+      { bucketRegistry: registry, logger: silentLogger, now: clock.now, fetchImpl },
+      {
+        costs: { "alchemy_*": 40 },
+        translations: [
+          {
+            canonical: "kiseki_getTokenBalances",
+            upstream: "alchemy_getTokenBalances",
+            mapRequest: (params) => [...params],
+            mapResponse: (result) => result,
+          },
+        ],
+      },
+    )
+
+    expect(adapter.capability().methods).toContain("kiseki_getTokenBalances")
+
+    await adapter.attempt(
+      group([
+        {
+          originalIndex: 0,
+          id: 0,
+          method: "kiseki_getTokenBalances",
+          params: ["0xabc"],
+          historical: false,
+        },
+      ]),
+      ctx(clock.now),
+    )
+
+    expect((calls[0]!.body as { method: string }).method).toBe("alchemy_getTokenBalances")
+    // 100 − 40 (the alchemy_* price), not 100 − 1.
+    expect(registry.peek("alchemy", "KEY_A")!.credits(0)).toEqual([60])
+  })
+
+  // `mapRequest` may return any shape the provider documents: an array of
+  // positional values (the node API) or an object of named fields (an enhanced
+  // API). The pool forwards it verbatim as the JSON-RPC `params` field.
+  const translatedBody = async (mapRequest: () => unknown) => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl, calls } = makeFetch([{ kind: "json", body: okResult(0, "0x1") }])
+    const adapter = createPoolAdapter(
+      { ...cfg, methods: ["eth_*", "trace_*", "alchemy_*"] },
+      { bucketRegistry: registry, logger: silentLogger, now: clock.now, fetchImpl },
+      {
+        translations: [
+          {
+            canonical: "kiseki_getTokenBalances",
+            upstream: "alchemy_getTokenBalances",
+            mapRequest,
+            mapResponse: (result) => result,
+          },
+        ],
+      },
+    )
+    await adapter.attempt(
+      group([
+        { originalIndex: 0, id: 7, method: "kiseki_getTokenBalances", params: ["0xabc"], historical: false },
+      ]),
+      ctx(clock.now),
+    )
+    return calls[0]!.body as { jsonrpc: string; id: unknown; method: string; params: unknown }
+  }
+
+  test("an object from mapRequest is sent as the JSON-RPC params, verbatim", async () => {
+    const body = await translatedBody(() => ({ address: "0xabc", chain: "eth", pageSize: 5 }))
+    expect(body.params).toEqual({ address: "0xabc", chain: "eth", pageSize: 5 })
+    expect(Array.isArray(body.params)).toBe(false)
+  })
+
+  test("an array from mapRequest still works (backward compatible)", async () => {
+    const body = await translatedBody(() => ["0xabc", "latest"])
+    expect(body.params).toEqual(["0xabc", "latest"])
+    expect(Array.isArray(body.params)).toBe(true)
+  })
+
+  test("a translation that rewrites params keeps the client's id and the upstream method", async () => {
+    const body = await translatedBody(() => ({ address: "0xabc" }))
+    expect(body).toEqual({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "alchemy_getTokenBalances",
+      params: { address: "0xabc" },
+    })
+  })
 })
 
 describe("pool: the CoreDeps.poolObserver seam (design.md §18.1)", () => {
@@ -974,5 +1081,429 @@ describe("pool: the CoreDeps.poolObserver seam (design.md §18.1)", () => {
     })
     const outcome = await adapter.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
     expect(outcome.kind).toBe("success")
+  })
+})
+
+/**
+ * Ankr research note, section "apikey salah", quoted verbatim: the gateway answers
+ * a wrong apikey with HTTP 404 and this HTML page, not JSON-RPC at all.
+ */
+const ANKR_HTML_404 =
+  "<html><head><title>404 Not Found</title></head>\n<body><center><h1>404 Not Found</h1></center><hr><center>nginx</center></body></html>"
+
+const htmlResponse = (status = 404) => ({
+  kind: "text" as const,
+  status,
+  body: ANKR_HTML_404,
+  headers: { "content-type": "text/html" },
+})
+
+describe("pool: 4xx non-JSON-RPC is misconfiguration, not sickness (Validasi #1)", () => {
+  test("the key cools down with a configuration reason and the provider is not parked", async () => {
+    const { pool, clock, registry, calls, logs } = harness({
+      responses: [htmlResponse(), { kind: "json", body: okResult(0, "0x1") }],
+      keys: [
+        { token: "KEY_A", label: "a" },
+        { token: "KEY_B", label: "b" },
+      ],
+      random: () => 0,
+      // A threshold of 1 would park the provider on the first cross-key failure, so
+      // this makes "not parked" a real assertion rather than an accident of 3 > 1.
+      sickThreshold: 1,
+    })
+
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("success")
+    expect(calls).toHaveLength(2)
+    expect(pool.isSick()).toBe(false)
+
+    const stateA = registry.all().find((state) => state.token === "KEY_A")!
+    expect(stateA.cooldownRemainingMs(0)).toBe(1_000) // exponential, first step
+    expect(stateA.activeCooldownReason(0)).toBe("misconfigured")
+    expect(stateA.misconfiguredHttpStatus(0)).toBe(404)
+
+    // The healthy key kept its streak reset: no cross-key failure was counted.
+    const warn = logs.find((log) => log.message === "upstream rejected the call as misconfigured")
+    expect(warn?.fields).toEqual({ upstream: "test-upstream", apikey: "a", status: 404 })
+    expect(JSON.stringify(logs)).not.toContain("nginx")
+  })
+
+  test("the key loses weight, so the router stops choosing it", async () => {
+    const { pool, clock } = harness({
+      responses: [htmlResponse()],
+      keys: [
+        { token: "KEY_A", label: "a", buckets: [{ capacity: 100, refill_per_second: 10 }] },
+      ],
+      random: () => 0,
+    })
+    expect(pool.weight()).toBeCloseTo(1, 10)
+    await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(pool.weight()).toBe(0)
+  })
+
+  test("when every key was rejected, the outcome is misconfigured with the status", async () => {
+    const { pool, clock, calls } = harness({
+      responses: [htmlResponse(), htmlResponse()],
+      keys: [
+        { token: "KEY_A", label: "a" },
+        { token: "KEY_B", label: "b" },
+      ],
+      random: () => 0,
+    })
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome).toEqual({ kind: "misconfigured", status: 404 })
+    expect(calls).toHaveLength(2)
+    expect(pool.isSick()).toBe(false)
+  })
+
+  test("the observer reports the new label and never bad_body", async () => {
+    const seen: string[] = []
+    const { pool, clock } = harness({
+      responses: [htmlResponse()],
+      observer: { onKeyAttempt: (_upstream, label, outcome) => seen.push(`${label}:${outcome}`) },
+    })
+    await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(seen).toEqual(["a:misconfigured"])
+  })
+
+  test("a 4xx WITH a JSON-RPC envelope is still a domain error (passthrough)", async () => {
+    const { pool, clock, calls } = harness({
+      responses: [
+        { kind: "text", status: 400, body: JSON.stringify(rpcError(0, -32602, "invalid params")) },
+      ],
+      keys: [
+        { token: "KEY_A", label: "a" },
+        { token: "KEY_B", label: "b" },
+      ],
+      random: () => 0,
+    })
+    const outcome = await pool.attempt(group([groupItem(0, "eth_call")]), ctx(clock.now))
+    expect(outcome.kind).toBe("domain_error")
+    expect(calls).toHaveLength(1) // final, no failover
+  })
+})
+
+describe("pool: 401/403 is misconfiguration, not sickness (Validasi #2)", () => {
+  test("the key cools down with a configuration reason and the provider is not parked", async () => {
+    const { pool, clock, registry } = harness({
+      responses: [
+        { kind: "text", status: 401, body: JSON.stringify({ error: "invalid api key" }) },
+        { kind: "json", body: okResult(0, "0x1") },
+      ],
+      keys: [
+        { token: "KEY_A", label: "a" },
+        { token: "KEY_B", label: "b" },
+      ],
+      random: () => 0,
+      sickThreshold: 1,
+    })
+
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("success")
+    expect(pool.isSick()).toBe(false)
+
+    const stateA = registry.all().find((state) => state.token === "KEY_A")!
+    expect(stateA.activeCooldownReason(0)).toBe("misconfigured")
+    expect(stateA.misconfiguredHttpStatus(0)).toBe(401)
+  })
+
+  test("all keys rejected with 401 → misconfigured, not sick", async () => {
+    const { pool, clock } = harness({
+      responses: [
+        { kind: "text", status: 401, body: "" },
+        { kind: "text", status: 403, body: "" },
+      ],
+      keys: [
+        { token: "KEY_A", label: "a" },
+        { token: "KEY_B", label: "b" },
+      ],
+      random: () => 0,
+      sickThreshold: 1,
+    })
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("misconfigured")
+    // Both keys cool down for the same span, so either rejection is a truthful
+    // status; what matters is that it is a rejection status, not a capacity hint.
+    if (outcome.kind === "misconfigured") {
+      expect(outcome.status === 401 || outcome.status === 403).toBe(true)
+    }
+    expect(pool.isSick()).toBe(false)
+  })
+
+  test("misconfigured mixed with unauthorized still yields misconfigured", async () => {
+    const { pool, clock } = harness({
+      responses: [htmlResponse(), { kind: "text", status: 401, body: "" }],
+      keys: [
+        { token: "KEY_A", label: "a" },
+        { token: "KEY_B", label: "b" },
+      ],
+      random: () => 0,
+    })
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("misconfigured")
+  })
+})
+
+describe("pool: the diagnosis does not sweep other problems (Validasi #4)", () => {
+  test("a key that never got tried because it cannot afford the cost defeats it", async () => {
+    // A is rejected; B is drained so `canAfford` fails before any fetch. B will
+    // recover, so the truthful answer is rate_limited, not misconfigured.
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl, calls } = makeFetch([htmlResponse()])
+    const pool = new ApikeyPool({
+      instance: "u",
+      provider: "test",
+      keys: [
+        { token: "A", label: "a", buckets: [{ capacity: 100, refill_per_second: 10 }] },
+        { token: "B", label: "b", buckets: [{ capacity: 100, refill_per_second: 10 }] },
+      ],
+      url: (token) => `https://u.test/${token}`,
+      costFor: () => 1,
+      random: () => 0,
+      deps: { bucketRegistry: registry, logger: silentLogger, now: clock.now, fetchImpl },
+    })
+    registry.peek("test", "B")!.deduct(100, 0)
+
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("rate_limited")
+    expect(calls).toHaveLength(1)
+    expect(pool.misconfigured()).toBeUndefined()
+  })
+
+  test("a key cooling down for health mixed with a rejected one defeats it", async () => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl } = makeFetch([htmlResponse()])
+    const pool = new ApikeyPool({
+      instance: "u",
+      provider: "test",
+      keys: [
+        { token: "A", label: "a", buckets: [{ capacity: 100, refill_per_second: 10 }] },
+        { token: "B", label: "b", buckets: [{ capacity: 100, refill_per_second: 10 }] },
+      ],
+      url: (token) => `https://u.test/${token}`,
+      costFor: () => 1,
+      random: () => 0,
+      deps: { bucketRegistry: registry, logger: silentLogger, now: clock.now, fetchImpl },
+    })
+    // B was parked by a 5xx on an earlier request; A is rejected now.
+    registry.peek("test", "B")!.markFailure(0)
+
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("rate_limited")
+    expect(pool.misconfigured()).toBeUndefined()
+  })
+
+  test("a key cooling down for 429 mixed with a rejected one defeats it", async () => {
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl } = makeFetch([htmlResponse()])
+    const pool = new ApikeyPool({
+      instance: "u",
+      provider: "test",
+      keys: [
+        { token: "A", label: "a", buckets: [{ capacity: 100, refill_per_second: 10 }] },
+        { token: "B", label: "b", buckets: [{ capacity: 100, refill_per_second: 10 }] },
+      ],
+      url: (token) => `https://u.test/${token}`,
+      costFor: () => 1,
+      random: () => 0,
+      deps: { bucketRegistry: registry, logger: silentLogger, now: clock.now, fetchImpl },
+    })
+    registry.peek("test", "B")!.markRateLimited(0, 5_000)
+
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("rate_limited")
+    expect(pool.misconfigured()).toBeUndefined()
+  })
+
+  test("the diagnosis is derived from shared identity state, so another instance sees it", async () => {
+    // The identity `(test, A)` is shared across chain instances. Instance one is
+    // rejected; instance two — a different pool with the same key — must derive the
+    // same diagnosis from the same state object, with no fetch and no snapshot.
+    const clock = makeClock()
+    const registry = new BucketRegistry(clock.now)
+    const { fetchImpl, calls } = makeFetch([htmlResponse(), { kind: "json", body: okResult(0, "0x1") }])
+    const deps = { bucketRegistry: registry, logger: silentLogger, now: clock.now, fetchImpl }
+    const keys = [{ token: "A", label: "a", buckets: [{ capacity: 100, refill_per_second: 10 }] }]
+
+    const ethereum = new ApikeyPool({
+      instance: "ethereum",
+      provider: "test",
+      keys,
+      url: (token) => `https://eth.test/${token}`,
+      costFor: () => 1,
+      deps,
+    })
+    const base = new ApikeyPool({
+      instance: "base",
+      provider: "test",
+      keys,
+      url: (token) => `https://base.test/${token}`,
+      costFor: () => 1,
+      deps,
+    })
+
+    const first = await ethereum.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(first).toEqual({ kind: "misconfigured", status: 404 })
+    expect(calls).toHaveLength(1)
+
+    // Base never called out, but the shared key state already proves the problem.
+    expect(base.misconfigured()).toEqual({ untilMs: 1_000, status: 404 })
+    expect(base.weight()).toBe(0)
+  })
+})
+
+describe("pool: one bad key does not condemn the instance (Validasi #5)", () => {
+  test("a healthy key serves the group and clears the streak", async () => {
+    const { pool, clock, registry, calls } = harness({
+      responses: [htmlResponse(), { kind: "json", body: okResult(0, "0x1") }],
+      keys: [
+        { token: "KEY_A", label: "a" },
+        { token: "KEY_B", label: "b" },
+      ],
+      random: () => 0,
+    })
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("success")
+    expect(calls).toHaveLength(2)
+    expect(pool.misconfigured()).toBeUndefined()
+    const stateB = registry.all().find((state) => state.token === "KEY_B")!
+    expect(stateB.health.cooldownReason).toBeUndefined()
+    // Only B contributes, and it paid one credit for its attempt.
+    expect(pool.weight()).toBeCloseTo(0.99, 10)
+  })
+})
+
+describe("pool: sendRawTransaction with configuration rejections (Validasi #8)", () => {
+  const sendRaw = () =>
+    group([groupItem(0, "eth_sendRawTransaction")], { idempotency: "NON_IDEMPOTENT" })
+
+  test("4xx non-JSON-RPC stays ambiguous but records the configuration reason", async () => {
+    const { pool, clock, registry, calls, logs } = harness({
+      responses: [htmlResponse(), { kind: "json", body: okResult(0, "0xhash") }],
+      keys: [
+        { token: "KEY_A", label: "a" },
+        { token: "KEY_B", label: "b" },
+      ],
+      random: () => 0,
+    })
+    const outcome = await pool.attempt(sendRaw(), ctx(clock.now))
+    // Invariant 3: neither level may continue, because we cannot prove the tx
+    // never reached the node.
+    expect(outcome.kind).toBe("ambiguous")
+    expect(calls).toHaveLength(1)
+
+    const stateA = registry.all().find((state) => state.token === "KEY_A")!
+    expect(stateA.activeCooldownReason(0)).toBe("misconfigured")
+    expect(stateA.misconfiguredHttpStatus(0)).toBe(404)
+
+    const warn = logs.find((log) => log.message === "sendRaw ambiguous")
+    expect(warn?.fields?.reason).toBe("misconfigured")
+  })
+
+  test("the next sendRaw during the cooldown is misconfigured, not rate_limited", async () => {
+    const { pool, clock, calls } = harness({
+      responses: [htmlResponse()],
+      keys: [{ token: "KEY_A", label: "a" }],
+      random: () => 0,
+    })
+    await pool.attempt(sendRaw(), ctx(clock.now))
+    expect(calls).toHaveLength(1)
+
+    const second = await pool.attempt(sendRaw(), ctx(clock.now))
+    expect(second).toEqual({ kind: "misconfigured", status: 404 })
+    expect(calls).toHaveLength(1) // no fetch: the diagnosis is passive
+  })
+
+  test("401/403 on sendRaw still fails over between keys, then reports misconfigured", async () => {
+    const { pool, clock, calls } = harness({
+      responses: [
+        { kind: "text", status: 401, body: "" },
+        { kind: "text", status: 401, body: "" },
+      ],
+      keys: [
+        { token: "KEY_A", label: "a" },
+        { token: "KEY_B", label: "b" },
+      ],
+      random: () => 0,
+      sickThreshold: 1,
+    })
+    const outcome = await pool.attempt(sendRaw(), ctx(clock.now))
+    // Previously this path ended in `sick` → 429 / -32006.
+    expect(outcome).toEqual({ kind: "misconfigured", status: 401 })
+    expect(calls).toHaveLength(2)
+    expect(pool.isSick()).toBe(false)
+  })
+})
+
+describe("pool: old behaviour is unchanged (Validasi #10)", () => {
+  test("429 still labels rate_limited and never misconfigured", async () => {
+    const { pool, clock, registry } = harness({
+      responses: [{ kind: "text", status: 429, body: "" }],
+      keys: [{ token: "KEY_A", label: "a" }],
+    })
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("rate_limited")
+    const state = registry.all()[0]!
+    expect(state.activeCooldownReason(0)).toBe("rate_limited")
+    expect(pool.misconfigured()).toBeUndefined()
+  })
+
+  test("5xx still labels unhealthy and still parks the provider at the threshold", async () => {
+    const { pool, clock, registry } = harness({
+      responses: [{ kind: "text", status: 500, body: "boom" }],
+      keys: [
+        { token: "KEY_A", label: "a" },
+        { token: "KEY_B", label: "b" },
+        { token: "KEY_C", label: "c" },
+      ],
+      random: () => 0,
+    })
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("sick")
+    expect(pool.isSick()).toBe(true)
+    for (const state of registry.all()) expect(state.activeCooldownReason(0)).toBe("unhealthy")
+    expect(pool.misconfigured()).toBeUndefined()
+  })
+
+  test("a server_error mixed with a rejection still ends sick, not misconfigured", async () => {
+    // The health signal wins: a real 5xx on this attempt is evidence about the
+    // provider, and the rejected key alone cannot explain the whole instance.
+    const { pool, clock } = harness({
+      responses: [htmlResponse(), { kind: "text", status: 500, body: "boom" }],
+      keys: [
+        { token: "KEY_A", label: "a" },
+        { token: "KEY_B", label: "b" },
+      ],
+      random: () => 0,
+      sickThreshold: 1,
+    })
+    const outcome = await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(outcome.kind).toBe("sick")
+  })
+
+  test("the reason alternates as the last writer says", async () => {
+    const { pool, clock, registry } = harness({
+      responses: [
+        htmlResponse(),
+        { kind: "text", status: 429, body: "" },
+        htmlResponse(),
+      ],
+      keys: [{ token: "KEY_A", label: "a" }],
+    })
+    const state = () => registry.all()[0]!
+
+    await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(state().activeCooldownReason(0)).toBe("misconfigured")
+
+    clock.set(2_000)
+    await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(state().activeCooldownReason(2_000)).toBe("rate_limited")
+
+    clock.set(20_000)
+    await pool.attempt(group([groupItem(0, "eth_blockNumber")]), ctx(clock.now))
+    expect(state().activeCooldownReason(20_000)).toBe("misconfigured")
   })
 })

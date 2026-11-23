@@ -19,6 +19,8 @@ export const ERROR_UNAUTHORIZED = -32000
 export const ERROR_CAPACITY_EXHAUSTED = -32005
 export const ERROR_NO_HEALTHY_UPSTREAM = -32006
 export const ERROR_BROADCAST_UNKNOWN = -32007
+/** The upstream rejected the call as a configuration problem, not capacity. */
+export const ERROR_UPSTREAM_MISCONFIGURED = -32008
 export const ERROR_METHOD_UNSUPPORTED = -32601
 export const ERROR_INVALID_REQUEST = -32600
 export const ERROR_UNKNOWN_CHAIN = -32602
@@ -73,6 +75,19 @@ export const capacityExhausted = (retryAfterMs: number): JsonRpcError => ({
 export const noHealthyUpstream = (): JsonRpcError => ({
   code: ERROR_NO_HEALTHY_UPSTREAM,
   message: "no healthy upstream available",
+})
+
+/**
+ * The upstream rejected the call before any node answered it (wrong apikey, wrong
+ * `url_template`). This is a configuration problem, not capacity and not health,
+ * so it is never answered with `429`: there is no honest `Retry-After` for a
+ * config that will not fix itself. `status` is the HTTP status of the rejection,
+ * when the provider reported one.
+ */
+export const upstreamMisconfigured = (status?: number): JsonRpcError => ({
+  code: ERROR_UPSTREAM_MISCONFIGURED,
+  message: "upstream is misconfigured",
+  ...(status === undefined ? {} : { data: { status } }),
 })
 
 /** `eth_sendRawTransaction` state unknown (design.md §11.3): never retried. */

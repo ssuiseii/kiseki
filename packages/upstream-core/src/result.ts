@@ -21,9 +21,16 @@ export type ResponseClass =
   /** 5xx / unparseable body — provider looks unhealthy. */
   | { kind: "server_error"; reason: string }
   /** 401/403 — the key itself is rejected; do not hammer it. */
-  | { kind: "unauthorized"; reason: string }
-  /** Other 4xx — the request itself is wrong; retrying elsewhere will not help. */
+  | { kind: "unauthorized"; reason: string; status: number }
+  /** Other 4xx whose body IS a JSON-RPC envelope: the items themselves decide. */
   | { kind: "client_error"; status: number }
+  /**
+   * Other 4xx whose body is not a JSON-RPC envelope at all (HTML gateway page,
+   * empty body, JSON primitive). The call was rejected before any node answered
+   * it — a configuration problem (wrong apikey, wrong `url_template`), not the
+   * client's request and not the provider's health.
+   */
+  | { kind: "misconfigured"; status: number }
 
 /** Per-item verdict produced from a JSON-RPC body. */
 export type ItemVerdict =
@@ -55,6 +62,25 @@ export const parseRetryAfter = (headers: Headers, nowMs: number): number | undef
   return Math.min(Math.max(0, date - nowMs), 300_000)
 }
 
+/**
+ * Does this body look like something `classifyBody` could read envelopes from?
+ *
+ * The test is deliberately a pure shape test, mirroring `classifyBody`'s own input
+ * domain: a single object or an array. It never looks at content (no
+ * `content-type`, no provider string), so it applies to every gateway alike.
+ * `id: null` and envelopes without `id` still pass — an error JSON-RPC answer is
+ * often exactly that — while HTML, an empty body and JSON primitives do not.
+ */
+const isEnvelopeShaped = (text: string): boolean => {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return false
+  }
+  return typeof parsed === "object" && parsed !== null
+}
+
 /** HTTP status → response class. */
 export const classifyResponse = (
   response: PostJsonResult,
@@ -68,13 +94,18 @@ export const classifyResponse = (
     return { kind: "rate_limited", retryAfterMs: parseRetryAfter(headers, nowMs) }
   }
   if (status === 401 || status === 403) {
-    return { kind: "unauthorized", reason: `http ${status}` }
+    return { kind: "unauthorized", reason: `http ${status}`, status }
   }
   if (status >= 500) {
     return { kind: "server_error", reason: `http ${status}` }
   }
   if (status >= 400) {
-    return { kind: "client_error", status }
+    // A 4xx with a JSON envelope body is the node answering (a domain error per
+    // item, final). A 4xx without one was rejected by the gateway: the call never
+    // became a JSON-RPC answer, which points at the configuration behind it.
+    return isEnvelopeShaped(text)
+      ? { kind: "client_error", status }
+      : { kind: "misconfigured", status }
   }
   if (text.trim() === "") {
     return { kind: "server_error", reason: "empty body" }

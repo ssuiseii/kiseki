@@ -113,28 +113,67 @@ describe("Alchemy CU table (design.md §5.3, §15)", () => {
   })
 })
 
-describe("Alchemy capability signatures (design.md §8.3)", () => {
+describe("Alchemy capability signatures (ARCHITECTURE.md, '6.2 Sinyal mismatch kapabilitas')", () => {
   const match = (code: number, message: string, historical = false) =>
     composeMatchers(matchAlchemyCapability)(
       { code, message },
       historical,
     )
 
+  // Verbatim strings from notes/research-notes/alchemy-provider.md (§3, §5, §6).
+  // Never invent a provider message: copy it from the note.
+
   test("-32601 is a method mismatch", () => {
     expect(match(-32601, "the method trace_block does not exist/is not available")).toBe("method")
   })
 
-  test("a plan-gated method is a method mismatch even without -32601", () => {
-    expect(match(-32000, "method is not available on free plan, please upgrade to paid plan")).toBe(
-      "method",
-    )
+  test("a Free-tier trace_* refusal is a method mismatch (verbatim, §6)", () => {
+    expect(
+      match(
+        -32600,
+        "trace_block is not available on the Free tier - upgrade to Pay As You Go, or Enterprise for access.",
+      ),
+    ).toBe("method")
+  })
+
+  test("a Free-tier debug_* refusal is a method mismatch (verbatim, §3)", () => {
+    expect(
+      match(
+        -32600,
+        "debug_traceTransaction is not available on the Free tier - upgrade to Pay As You Go, or Enterprise for access.",
+      ),
+    ).toBe("method")
+  })
+
+  test("an Unsupported method refusal is a method mismatch (verbatim, §3)", () => {
+    expect(match(-32600, "Unsupported method: eth_coinbase on ETH_MAINNET")).toBe("method")
+  })
+
+  test("a network-scoped unavailability is a method mismatch (verbatim, §3)", () => {
+    // The note records this message truncated ("..."); only the recorded part is used.
+    expect(match(-32600, "net_peerCount is not available on the ETH_MAINNET")).toBe("method")
+  })
+
+  test("the eth_getLogs 10-block-range message is NOT a method mismatch (verbatim, §5)", () => {
+    // It mentions "Free tier" and "PAYG" but is a request-shape limit, per method
+    // per instance would wrongly route all future eth_getLogs away. Must stay null.
+    expect(
+      match(
+        -32600,
+        "Under the Free tier plan, you can make eth_getLogs requests with up to a 10 block range. Based on your parameters, this block range should work: [0x193d000, 0x193d009]. Upgrade to PAYG for expanded block range.",
+      ),
+    ).toBeNull()
+  })
+
+  test("-32600 without a refusal message is not a mismatch (e.g. auth failure, §1)", () => {
+    expect(match(-32600, "Must be authenticated!")).toBeNull()
   })
 
   test("Alchemy's pruned-state wording stays an archive mismatch", () => {
     expect(match(-32000, "state at block #100 is pruned", true)).toBe("archive")
   })
 
-  test("domain errors are not mismatches (#36 passthrough)", () => {
+  test("domain errors are not mismatches (passthrough)", () => {
     expect(match(-32000, "nonce too low")).toBeNull()
     expect(match(3, "execution reverted: NotOwner")).toBeNull()
     expect(match(-32000, "insufficient funds for gas * price + value")).toBeNull()
@@ -152,6 +191,21 @@ describe("Alchemy capability signatures (design.md §8.3)", () => {
         ),
     })
     const outcome = await adapter.attempt(group("alchemy_foo"), ctx)
+    expect(outcome.kind).toBe("unsupported")
+  })
+
+  test("a -32600 Unsupported method refusal becomes an unsupported outcome through the adapter", async () => {
+    const { adapter } = harness({
+      response: () =>
+        new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 0,
+            error: { code: -32600, message: "Unsupported method: eth_coinbase on ETH_MAINNET" },
+          }),
+        ),
+    })
+    const outcome = await adapter.attempt(group("eth_coinbase"), ctx)
     expect(outcome.kind).toBe("unsupported")
   })
 })

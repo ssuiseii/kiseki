@@ -13,13 +13,25 @@
  * The router never sees any of this: it gets one `UpstreamOutcome`.
  */
 
-import type { CoreDeps, UpstreamAdapter, UpstreamInstanceConfig } from "./adapter"
+import type {
+  CoreDeps,
+  MisconfiguredState,
+  UpstreamAdapter,
+  UpstreamInstanceConfig,
+} from "./adapter"
 import { ApiKeyState, type BucketSpec } from "./bucket"
 import { buildLayeredCostResolver, type CostResolver, type CostTable } from "./cost"
 import type { CapabilityErrorMatcher } from "./capsig"
 import { postJson, type PostJsonOptions } from "./http"
+import {
+  canonicalMappingFailed,
+  canonicalTransportUnsupported,
+  coveredCanonicalMethods,
+  invalidCanonicalParams,
+  type MethodTranslation,
+} from "./namespace"
 import { classifyBody, classifyResponse, verdictToEntry, type ItemVerdict } from "./result"
-import type { AttemptCtx, Group } from "./types/group"
+import type { AttemptCtx, Group, GroupItem } from "./types/group"
 import type { Entry, UnsupportedItem, UpstreamOutcome } from "./types/outcome"
 
 /** Weight floor so a ready-but-drained key still has a non-zero chance (§7.2). */
@@ -60,6 +72,12 @@ export type ApikeyPoolOptions = {
   headers?(token: string): Record<string, string>
   /** Per-instance timeout override; wins over the classifier value (§14). */
   timeoutMs?: number
+  /**
+   * Canonical-namespace table (`kiseki_*` → provider method). Absent = this
+   * instance serves no canonical methods; the engine then behaves exactly as
+   * before (namespace.ts).
+   */
+  translations?: readonly MethodTranslation[]
   deps: CoreDeps
   observer?: PoolObserver
   /** Test seam for weighted-random. Defaults to Math.random. */
@@ -69,7 +87,32 @@ export type ApikeyPoolOptions = {
 }
 
 /** Why one key did not serve the group; drives the next iteration. */
-type RetryReason = "rate_limited" | "server_error"
+type RetryReason = "rate_limited" | "server_error" | "misconfigured"
+
+/**
+ * One item as it will actually go upstream: `method`/`params` are already the
+ * provider's when a translation applies, while `item` stays the client-visible
+ * one so classification, regrouping and the final `Entry` keep naming what the
+ * client asked for.
+ */
+export type OutboundItem = {
+  item: GroupItem
+  /** Method actually sent (the upstream name when translated). */
+  method: string
+  /**
+   * The JSON-RPC `params` as the provider wants them: whatever `mapRequest`
+   * returned (object or array) for a translated item, the client's array
+   * otherwise. JSON-RPC 2.0 allows both shapes.
+   */
+  params: unknown
+}
+
+/** A group split into "what to send" and "what was answered locally". */
+type PreparedGroup = {
+  send: OutboundItem[]
+  /** Canonical params that could not be mapped: domain errors, no fetch. */
+  preAnswered: Entry[]
+}
 
 type KeyAttempt =
   | { stop: true; outcome: UpstreamOutcome }
@@ -84,6 +127,8 @@ export class ApikeyPool {
   private readonly keys: KeyRef[]
   private readonly random: () => number
   private readonly sickThreshold: number
+  /** Canonical name → translation. Empty when the package serves none. */
+  private readonly translations: ReadonlyMap<string, MethodTranslation>
   /** Consecutive key failures across distinct keys (design.md §13). */
   private crossKeyFailures = 0
   private sickUntilMs = 0
@@ -95,6 +140,9 @@ export class ApikeyPool {
     this.provider = options.provider
     this.random = options.random ?? Math.random
     this.sickThreshold = options.sickThreshold ?? DEFAULT_SICK_THRESHOLD
+    this.translations = new Map(
+      (options.translations ?? []).map((translation) => [translation.canonical, translation]),
+    )
     this.keys = options.keys.map((key) => ({
       label: key.label,
       state: options.deps.bucketRegistry.get(options.provider, key.token, key.buckets),
@@ -149,14 +197,167 @@ export class ApikeyPool {
   }
 
   /**
+   * Configuration diagnosis derived from key state, never stored on the pool.
+   *
+   * The instance counts as misconfigured only when EVERY key is cooling down with
+   * `cooldownReason === "misconfigured"`. A key that was never tried (out of
+   * credit), or one cooling down for health or capacity, disqualifies the
+   * diagnosis: those keys will recover, so `-32005` with a Retry-After is the
+   * truthful answer, not `-32008`.
+   *
+   * Because `ApiKeyState` is identity-keyed, a chain instance sharing the same
+   * key derives the same diagnosis from the same state — nothing is snapshotted
+   * here, and a diagnosis formed on ethereum is visible on base.
+   */
+  misconfigured(): MisconfiguredState | undefined {
+    if (this.keys.length === 0) return undefined
+    const nowMs = this.options.deps.now()
+
+    let untilMs = Number.POSITIVE_INFINITY
+    let status: number | undefined
+    for (const key of this.keys) {
+      if (key.state.activeCooldownReason(nowMs) !== "misconfigured") return undefined
+      const remaining = key.state.cooldownRemainingMs(nowMs)
+      const keyUntilMs = nowMs + remaining
+      if (keyUntilMs < untilMs) {
+        untilMs = keyUntilMs
+        // The status belongs to the key that recovers first: that is the key whose
+        // next answer will re-derive the truth for the whole instance.
+        status = key.state.misconfiguredHttpStatus(nowMs)
+      }
+    }
+
+    return status === undefined ? { untilMs } : { untilMs, status }
+  }
+
+  /**
    * Cost of one item. A cost of 0 is legitimate — Alchemy bills 0 CU for
    * `eth_chainId`/`net_version`/… — so only a missing or unusable number falls
    * back to 1. `buildLayeredCostResolver` already guarantees a number, this is
    * just belt-and-braces against a custom `costFor`.
+   *
+   * The name passed here is the EFFECTIVE one (the upstream method for a
+   * translated item): a provider's cost table prices its own method names, so
+   * `kiseki_getTokenTransfers` must be charged whatever `ankr_getTokenTransfers`
+   * costs, not the implicit 1 (namespace.ts, plan A §4.4).
    */
   private itemCost(method: string): number {
     const cost = this.options.costFor(method)
     return Number.isFinite(cost) && cost >= 0 ? cost : 1
+  }
+
+  /**
+   * Translate the canonical items of a group and split off the ones whose
+   * canonical params are invalid.
+   *
+   * `mapRequest → undefined` means the CLIENT sent something the canonical
+   * schema rejects. That is a domain error for that item — final, no regroup,
+   * no fetch — and it must never be mistaken for a capability mismatch: the
+   * upstream is fine, the request is not (namespace.ts).
+   */
+  private prepare(group: Group): PreparedGroup {
+    const send: OutboundItem[] = []
+    const preAnswered: Entry[] = []
+
+    for (const item of group.items) {
+      const translation = this.translations.get(item.method)
+      if (translation === undefined) {
+        send.push({ item, method: item.method, params: item.params })
+        continue
+      }
+
+      // `capability()` never advertises a transport the engine cannot send, so
+      // this only triggers for a hand-built adapter. Answer locally and final:
+      // posting a JSON-RPC envelope to a REST endpoint would be worse.
+      if ((translation.transport ?? "jsonrpc") !== "jsonrpc") {
+        this.options.deps.logger.error("canonical transport not implemented", {
+          upstream: this.instance,
+          method: item.method,
+          transport: translation.transport,
+        })
+        preAnswered.push({
+          originalIndex: item.originalIndex,
+          ok: false,
+          error: canonicalTransportUnsupported(item.method),
+          final: true,
+        })
+        continue
+      }
+
+      let mapped: unknown
+      try {
+        mapped = translation.mapRequest(item.params, group.chain)
+      } catch (error) {
+        // A throwing mapRequest is a package bug. Treat it as invalid params
+        // rather than letting one item take down the whole batch.
+        mapped = undefined
+        this.logMappingFailure(item.method, "mapRequest", error)
+      }
+
+      if (mapped === undefined) {
+        preAnswered.push({
+          originalIndex: item.originalIndex,
+          ok: false,
+          error: invalidCanonicalParams(item.method),
+          final: true,
+        })
+        continue
+      }
+
+      send.push({ item, method: translation.upstream, params: mapped })
+    }
+
+    return { send, preAnswered }
+  }
+
+  /**
+   * Apply `mapResponse` to the successful entries of one attempt.
+   *
+   * Provider ERRORS are never translated (decision #36: passthrough verbatim).
+   * A throw is a package bug, so it becomes a final domain error for that item —
+   * retrying another upstream cannot fix a mapping function, and it would burn
+   * quota for nothing.
+   */
+  private mapEntries(
+    entries: readonly Entry[],
+    sent: readonly OutboundItem[],
+    chain: string,
+  ): Entry[] {
+    const byIndex = new Map(sent.map((outbound) => [outbound.item.originalIndex, outbound]))
+
+    return entries.map((entry) => {
+      if (!entry.ok) return entry
+      const outbound = byIndex.get(entry.originalIndex)
+      if (outbound === undefined) return entry
+      const translation = this.translations.get(outbound.item.method)
+      if (translation === undefined) return entry
+
+      try {
+        return {
+          originalIndex: entry.originalIndex,
+          ok: true,
+          result: translation.mapResponse(entry.result, outbound.item.params, chain),
+        }
+      } catch (error) {
+        this.logMappingFailure(outbound.item.method, "mapResponse", error)
+        return {
+          originalIndex: entry.originalIndex,
+          ok: false,
+          error: canonicalMappingFailed(outbound.item.method),
+          final: true,
+        }
+      }
+    })
+  }
+
+  /** Log a package mapping bug: the method and the message, never a payload. */
+  private logMappingFailure(method: string, stage: string, error: unknown): void {
+    this.options.deps.logger.error("canonical namespace mapping failed", {
+      upstream: this.instance,
+      method,
+      stage,
+      reason: error instanceof Error ? error.message : "unknown",
+    })
   }
 
   /**
@@ -165,9 +366,12 @@ export class ApikeyPool {
    *
    * Charging the full sum up front is the conservative reading of "no refund":
    * a partially-failed batch still consumed its items' quota.
+   *
+   * `costNames` are the EFFECTIVE method names (upstream names for translated
+   * items), so a provider's own cost table prices its own methods (plan A §4.4).
    */
-  private chargeFor(group: Group): number {
-    const perItem = group.items.map((item) => this.itemCost(item.method))
+  private chargeFor(costNames: readonly string[]): number {
+    const perItem = costNames.map((method) => this.itemCost(method))
     if (perItem.length === 0) return 1
     if (this.options.countsBatchAsOne === true) return Math.max(...perItem)
     return perItem.reduce((sum, cost) => sum + cost, 0)
@@ -178,9 +382,9 @@ export class ApikeyPool {
    * large batch can still be served by a small bucket (it then goes into debt and
    * refills — conservative, never over-optimistic).
    */
-  private eligibilityCost(group: Group): number {
-    if (group.items.length === 0) return 1
-    return Math.max(...group.items.map((item) => this.itemCost(item.method)))
+  private eligibilityCost(costNames: readonly string[]): number {
+    if (costNames.length === 0) return 1
+    return Math.max(...costNames.map((method) => this.itemCost(method)))
   }
 
   /**
@@ -195,9 +399,17 @@ export class ApikeyPool {
       return { kind: "sick", retryAtMs: this.sickUntilMs }
     }
 
+    // Canonical items are rewritten once, before any key is chosen: the cost of
+    // the call and the body both depend on the upstream name, not the alias.
+    const prepared = this.prepare(group)
+    // Nothing left to send (every item was rejected by the canonical schema, or
+    // the group was empty): no key is charged and no request leaves the process.
+    // Those answers are final domain errors, never mismatches (§4.2).
+    if (prepared.send.length === 0) return this.poolOutcome([], prepared, group.chain)
+    const costNames = prepared.send.map((outbound) => outbound.method)
     const tried = new Set<string>()
-    const charge = this.chargeFor(group)
-    const eligibility = this.eligibilityCost(group)
+    const charge = this.chargeFor(costNames)
+    const eligibility = this.eligibilityCost(costNames)
     let sawServerFailure = false
     let retryAtMs = Number.POSITIVE_INFINITY
 
@@ -208,6 +420,15 @@ export class ApikeyPool {
       )
 
       if (ready.length === 0) {
+        // A configuration diagnosis outranks the capacity/health reading: when
+        // every key is parked because the gateway rejected it, waiting is not the
+        // answer and `sick` would park the provider for a `.env` problem.
+        const misconfigured = this.misconfigured()
+        if (misconfigured !== undefined) {
+          return misconfigured.status === undefined
+            ? { kind: "misconfigured" }
+            : { kind: "misconfigured", status: misconfigured.status }
+        }
         if (sawServerFailure) return { kind: "sick", retryAtMs: this.earliestReadyAt() }
         return {
           kind: "rate_limited",
@@ -220,13 +441,26 @@ export class ApikeyPool {
       // Deduct synchronously BEFORE the fetch, no refund on failure (§5.5).
       key.state.deduct(charge, nowMs)
 
-      const result = await this.tryKey(key, group, ctx, charge)
+      const result = await this.tryKey(key, group, prepared, ctx, charge)
 
       if (result.stop) return result.outcome
 
       if (result.reason === "rate_limited") {
         retryAtMs = Math.min(retryAtMs, key.state.readyAtMs(eligibility, now()))
         observer?.onKeyFailover?.(this.instance)
+        continue
+      }
+
+      if (result.reason === "misconfigured") {
+        // A rejected key is a configuration problem, not a sick provider: fail
+        // over to the next key (another key on the same instance may be fine), but
+        // never accumulate `crossKeyFailures` — that counter exists to park a
+        // provider whose HEALTH is failing.
+        observer?.onKeyFailover?.(this.instance)
+        logger.debug("key failover after configuration rejection", {
+          upstream: this.instance,
+          apikey: key.label,
+        })
         continue
       }
 
@@ -266,6 +500,7 @@ export class ApikeyPool {
   private async tryKey(
     key: KeyRef,
     group: Group,
+    prepared: PreparedGroup,
     ctx: AttemptCtx,
     charge: number,
   ): Promise<KeyAttempt> {
@@ -275,7 +510,7 @@ export class ApikeyPool {
 
     const postOptions: PostJsonOptions = {
       url: this.options.url(key.state.token),
-      body: buildBody(group),
+      body: buildRequests(prepared.send),
       timeoutMs: this.options.timeoutMs ?? group.timeoutMs,
       now,
       ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
@@ -328,14 +563,45 @@ export class ApikeyPool {
       }
 
       case "unauthorized": {
-        key.state.markFailure(now())
+        // 401/403 is the gateway rejecting the key, not the provider being sick:
+        // same class of problem as a 4xx that never became a JSON-RPC answer.
+        key.state.markFailure(now(), "misconfigured", responseClass.status)
         observer?.onKeyAttempt?.(this.instance, key.label, "unauthorized")
         logger.warn("apikey rejected by provider", {
           upstream: this.instance,
           apikey: key.label,
+          status: responseClass.status,
           reason: responseClass.reason,
         })
-        return { stop: false, reason: "server_error" }
+        return { stop: false, reason: "misconfigured" }
+      }
+
+      case "misconfigured": {
+        // The body was not a JSON-RPC envelope, so no node ever answered this
+        // call. Never log the body: a gateway error page is not guaranteed to be
+        // free of secrets.
+        key.state.markFailure(now(), "misconfigured", responseClass.status)
+        if (nonIdempotent) {
+          // We cannot prove the request never reached the node, so the sendRaw
+          // contract still stops BOTH levels (invariant 3). The key keeps the
+          // configuration reason, so later requests during the cooldown get a
+          // truthful `-32008` instead of a phantom `-32005`.
+          observer?.onKeyAttempt?.(this.instance, key.label, "ambiguous")
+          logger.warn("sendRaw ambiguous", {
+            upstream: this.instance,
+            apikey: key.label,
+            status: responseClass.status,
+            reason: "misconfigured",
+          })
+          return { stop: true, outcome: { kind: "ambiguous" } }
+        }
+        observer?.onKeyAttempt?.(this.instance, key.label, "misconfigured")
+        logger.warn("upstream rejected the call as misconfigured", {
+          upstream: this.instance,
+          apikey: key.label,
+          status: responseClass.status,
+        })
+        return { stop: false, reason: "misconfigured" }
       }
 
       case "server_error": {
@@ -365,19 +631,27 @@ export class ApikeyPool {
         break
     }
 
-    const classified = classifyBody(response.text, group.items, {
-      ...(this.options.matchCapability === undefined
-        ? {}
-        : { matchCapability: this.options.matchCapability }),
-      onCapabilityMismatch: (item, cap) => {
-        observer?.onCapabilityMismatch?.(this.instance, item.method, cap)
-        logger.warn("capability mismatch", {
-          upstream: this.instance,
-          method: item.method,
-          cap,
-        })
+    // Classification runs over the items actually SENT (client-side view), so a
+    // pre-answered canonical item is not mistaken for a missing envelope, and a
+    // mismatch is reported (and regrouped) under the canonical name while the
+    // capsig table still sees the provider error verbatim.
+    const classified = classifyBody(
+      response.text,
+      prepared.send.map((outbound) => outbound.item),
+      {
+        ...(this.options.matchCapability === undefined
+          ? {}
+          : { matchCapability: this.options.matchCapability }),
+        onCapabilityMismatch: (item, cap) => {
+          observer?.onCapabilityMismatch?.(this.instance, item.method, cap)
+          logger.warn("capability mismatch", {
+            upstream: this.instance,
+            method: item.method,
+            cap,
+          })
+        },
       },
-    })
+    )
 
     if (classified.verdicts.length === 0 || classified.missing.length > 0) {
       // Broken or partial body: not authoritative. READ → next key; sendRaw →
@@ -399,7 +673,7 @@ export class ApikeyPool {
     key.state.markSuccess()
     this.crossKeyFailures = 0
 
-    const outcome = this.poolOutcome(classified.verdicts)
+    const outcome = this.poolOutcome(classified.verdicts, prepared, group.chain)
     observer?.onKeyAttempt?.(this.instance, key.label, outcome.kind)
     logger.debug("upstream attempt", {
       upstream: this.instance,
@@ -418,12 +692,19 @@ export class ApikeyPool {
    *   - some mismatched        → `success` + `unsupportedItems`
    *   - only node answers      → `domain_error` (final, no failover)
    *   - otherwise              → `success`
+   *
+   * Entries whose canonical params were invalid were answered before the fetch;
+   * they are merged back here so the router sees one complete entry set for the
+   * items it handed over (implementation.md §2). They are real node-style
+   * answers — final domain errors — so they are never regrouped.
    */
-  private poolOutcome(verdicts: readonly ItemVerdict[]): UpstreamOutcome {
+  private poolOutcome(
+    verdicts: readonly ItemVerdict[],
+    prepared: PreparedGroup,
+    chain: string,
+  ): UpstreamOutcome {
     const unsupported: UnsupportedItem[] = []
-    const entries: Entry[] = []
-    let resultCount = 0
-    let errorCount = 0
+    const answered: Entry[] = [...prepared.preAnswered]
 
     for (const verdict of verdicts) {
       if (verdict.kind === "capability_mismatch") {
@@ -432,10 +713,18 @@ export class ApikeyPool {
       }
       const entry = verdictToEntry(verdict)
       if (entry === undefined) continue
-      if (entry.ok) resultCount += 1
-      else errorCount += 1
-      entries.push(entry)
+      answered.push(entry)
     }
+
+    // Success results are translated into the canonical shape here: the raw
+    // provider result never leaves the pool for a canonical item. Provider
+    // errors inside `entries` are already verbatim and stay untouched (#36).
+    const entries = this.mapEntries(answered, prepared.send, chain)
+
+    // Counted AFTER mapping, so a package that cannot map a real answer is
+    // classified by what the client actually receives.
+    const resultCount = entries.filter((entry) => entry.ok).length
+    const errorCount = entries.length - resultCount
 
     if (unsupported.length > 0 && entries.length === 0) {
       return { kind: "unsupported", items: unsupported }
@@ -462,16 +751,25 @@ export class ApikeyPool {
   }
 }
 
-/** Single item → object; batch → array. Ids are passed through untouched. */
-export const buildBody = (group: Group): unknown => {
-  const requests = group.items.map((item) => ({
+/**
+ * Single item → object; batch → array. Ids are passed through untouched.
+ *
+ * Works from the OUTBOUND view of a group, which is the client's items unless a
+ * canonical translation rewrote method/params (`prepare`).
+ */
+const buildRequests = (items: readonly OutboundItem[]): unknown => {
+  const requests = items.map((outbound) => ({
     jsonrpc: "2.0",
-    id: item.id,
-    method: item.method,
-    params: item.params,
+    id: outbound.item.id,
+    method: outbound.method,
+    params: outbound.params,
   }))
   return requests.length === 1 ? requests[0] : requests
 }
+
+/** Same body, built straight from a group whose items are all sent as-is. */
+export const buildBody = (group: Group): unknown =>
+  buildRequests(group.items.map((item) => ({ item, method: item.method, params: item.params })))
 
 export type AdapterHooks = {
   matchCapability?: CapabilityErrorMatcher
@@ -485,6 +783,11 @@ export type AdapterHooks = {
   countsBatchAsOne?: boolean
   observer?: PoolObserver
   random?(): number
+  /**
+   * Canonical-namespace table: the `kiseki_*` methods this provider can serve and
+   * how to map them. Absent/empty = no canonical coverage (namespace.ts).
+   */
+  translations?: readonly MethodTranslation[]
 }
 
 /**
@@ -521,17 +824,29 @@ export const createPoolAdapter = (
     countsBatchAsOne,
     ...(hooks.headers === undefined ? {} : { headers: hooks.headers }),
     ...(cfg.timeout_ms === undefined ? {} : { timeoutMs: cfg.timeout_ms }),
+    ...(hooks.translations === undefined ? {} : { translations: hooks.translations }),
     deps,
     ...(observer === undefined ? {} : { observer }),
     ...(hooks.random === undefined ? {} : { random: hooks.random }),
   })
 
+  // Canonical coverage is DERIVED, never written in config: a `kiseki_*` method
+  // is advertised only when the upstream method behind it is covered by
+  // `cfg.methods` (namespace.ts). An instance without translations therefore
+  // looks exactly as it did before: `kiseki_*` is uncovered, and pre-flight
+  // rejects it with -32601 instead of routing it somewhere it cannot be served.
+  const methods = [
+    ...cfg.methods,
+    ...coveredCanonicalMethods(cfg.methods, hooks.translations ?? []),
+  ]
+
   return {
     name: cfg.name,
     provider: cfg.provider,
-    capability: () => ({ methods: cfg.methods, archive: cfg.archive }),
+    capability: () => ({ methods, archive: cfg.archive }),
     weight: () => pool.weight(),
     earliestReadyAt: () => pool.earliestReadyAt(),
+    misconfigured: () => pool.misconfigured(),
     attempt: (group, ctx) => pool.attempt(group, ctx),
   }
 }

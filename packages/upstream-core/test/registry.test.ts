@@ -82,7 +82,7 @@ describe("adapter contract (design.md §7.1)", () => {
       now: () => 0,
     })
     expect(Object.keys(adapter).sort()).toEqual(
-      ["attempt", "capability", "earliestReadyAt", "name", "provider", "weight"].sort(),
+      ["attempt", "capability", "earliestReadyAt", "misconfigured", "name", "provider", "weight"].sort(),
     )
   })
 })

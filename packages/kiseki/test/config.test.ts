@@ -297,10 +297,10 @@ describe("rule 10 — reserved chain names", () => {
 describe("composition root (decision #37)", () => {
   test("an unregistered package is a startup error, never a silent fallback", () => {
     const cfg = base()
-    upstream(cfg).package = "ankr"
-    const error = expectIssues(cfg, /unknown adapter package "ankr"/)
+    upstream(cfg).package = "no-such-provider"
+    const error = expectIssues(cfg, /unknown adapter package "no-such-provider"/)
     // The message lists what IS available, so the operator can fix it directly.
-    expect(error.message).toMatch(/registered: generic, alchemy/)
+    expect(error.message).toMatch(/registered: generic, alchemy, ankr/)
   })
 
   test("a registry without any packages rejects every package name", () => {
