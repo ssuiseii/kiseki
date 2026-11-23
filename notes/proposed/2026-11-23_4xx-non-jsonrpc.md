@@ -5,7 +5,7 @@
 | **Jenis** | Proposal desain |
 | **Status** | Diajukan untuk review |
 | **Tanggal** | 23 November 2026 |
-| **Komponen** | `upstream-core` (klasifikasi respons, ApikeyPool, kontrak adapter, taksonomi outcome), `kiseki` (router, tabel kode error), dokumentasi arsitektur |
+| **Komponen** | `upstream-core` (klasifikasi respons, ApiKeyState, ApikeyPool, kontrak adapter, taksonomi outcome), `kiseki` (router, tabel kode error), dokumentasi arsitektur |
 | **Prasyarat** | Tidak ada |
 
 ---
@@ -28,30 +28,35 @@ Yang diusulkan:
    tetap `client_error` (jawaban node sah, termasuk yang memakai `id: null`,
    di-parse per item seperti hari ini).
 2. Pool menangani `misconfigured` **dan** `unauthorized` sebagai **kegagalan
-   konfigurasi upstream ini, bukan kesehatan provider**: key tetap diberi cooldown
-   eksponensial (mengurangi bobotnya, membatasi pemborosan kuota), tetapi
-   kegagalan ini tidak menambah `crossKeyFailures` dan tidak memarkir provider.
-3. **Diagnosis bertahan lintas request.** Pool menyimpan masa berlaku diagnosis
-   (sampai cooldown key pertama berakhir, maksimum 60 detik) dan mengeksposnya
-   lewat satu accessor skalar baru pada `UpstreamAdapter`. Router memakainya untuk
-   melewatkan upstream yang sedang salah konfigurasi **tanpa fetch dan tanpa
-   pemotongan kuota**, memfinalisasi item sebagai `-32008` bila tidak ada kandidat
-   lain, dan mengecualikannya dari estimasi `Retry-After` — sehingga diagnosis
-   tetap benar pada request-request berikutnya selama cooldown, bukan hanya pada
-   request pertama.
+   konfigurasi key, bukan kesehatan provider**: key tetap diberi cooldown
+   eksponensial, tetapi kegagalan ini tidak menambah `crossKeyFailures` dan tidak
+   memarkir provider.
+3. **Alasan cooldown dicatat di `ApiKeyState`** (tingkat identitas `(provider,
+   token)`, dipakai bersama semua instance yang mereferensikan key itu), dan
+   diagnosis **diturunkan dari kondisi key**, bukan disimpan sebagai snapshot di
+   pool: upstream dianggap salah konfigurasi hanya bila **setiap** key-nya sedang
+   cooldown dengan alasan salah konfigurasi. Router membacanya lewat satu accessor
+   skalar baru pada `UpstreamAdapter`, melewatkan upstream yang sedang salah
+   konfigurasi **tanpa fetch dan tanpa pemotongan kuota**, memfinalisasi item
+   sebagai `-32008` bila tidak ada kandidat lain, dan mengecualikannya dari
+   estimasi `Retry-After` — sehingga diagnosis tetap benar pada request-request
+   berikutnya selama cooldown, di instance mana pun key itu dipakai.
 4. Outcome baru di taksonomi, `{ kind: "misconfigured"; status? }`, dan kode error
-   proxy baru **`-32008`**: respons akhirnya HTTP `200` + `-32008`, bukan
-   `429` + `-32006`.
+   proxy baru **`-32008`** dengan pesan `"upstream is misconfigured"` (keduanya
+   sudah disepakati): respons akhirnya HTTP `200` + `-32008`, bukan `429` +
+   `-32006`.
 5. Untuk `eth_sendRawTransaction`: hasil 4xx non-JSON-RPC tetap `ambiguous`
    (`-32007`, menghentikan kedua level) karena catatan riset tidak menyatakan
-   apakah penolakan gateway terjadi sebelum request sampai ke node; hasil
-   401/403 tetap failover seperti hari ini, tetapi finalisasinya ketika semua key
-   menolak berubah dari `sick` / `429` / `-32006` menjadi `200` / `-32008`.
+   apakah penolakan gateway terjadi sebelum request sampai ke node — tetapi key
+   yang menolak tetap mencatat alasan salah konfigurasi, sehingga request
+   berikutnya selama cooldown mendapat `-32008`, bukan `-32005`. Hasil 401/403
+   tetap failover seperti hari ini, tetapi finalisasinya ketika semua key menolak
+   berubah dari `sick` / `429` / `-32006` menjadi `200` / `-32008`.
 
 Yang diminta dari reviewer: persetujuan atas kelas klasifikasi baru, perluasan
-cakupan ke `unauthorized`, outcome baru, kode error `-32008`, bentuk cooldown key,
-**penambahan satu member pada kontrak `UpstreamAdapter`**, dan kebijakan
-finalisasi/estimasi di router.
+cakupan ke `unauthorized`, outcome baru, kode error `-32008`, pencatatan alasan
+cooldown di `ApiKeyState`, dan **penambahan satu member pada kontrak
+`UpstreamAdapter`**.
 
 ---
 
@@ -127,6 +132,9 @@ upstream tersebut.
 - Request selama masa diagnosis tidak menembak gateway, tidak memotong kuota, dan
   tetap menghasilkan `200` / `-32008` — bukan `429` / `-32005` dengan
   `Retry-After` sisa cooldown.
+- Diagnosis hanya aktif bila **setiap** key instance sedang cooldown karena
+  salah konfigurasi — key yang belum dicoba, sedang cooldown karena kesehatan,
+  atau sedang cooldown karena 429 menggugurkan diagnosis.
 - Estimasi `Retry-After` tidak pernah memakai cooldown upstream yang salah
   konfigurasi, pada request mana pun.
 - Klien dan operator dapat membedakan masalah konfigurasi dari masalah kapasitas
@@ -186,27 +194,62 @@ diterima; uji lebih ketat (mewajibkan `result`/`error`) akan mengubah perilaku
 respons node yang sah tanpa `id`, dan uji yang mewajibkan `id` salah terhadap
 `id: null`.
 
-### 2. Pool: cooldown key tetap, sinyal kesehatan provider dihapus, diagnosis tersimpan
+### 2. `ApiKeyState`: alasan cooldown dicatat di tingkat identitas
 
-Di `tryKey`, kelas `misconfigured` dan `unauthorized` ditangani oleh satu kebijakan
-yang sama, dengan satu perbedaan label:
+`KeyHealth` (pada `bucket.ts`) bertambah satu field:
 
-- **Cooldown key tetap ada**, memakai `markFailure` yang sudah ada: eksponensial
-  1 s → 2 s → … maksimum 60 s. Alasannya:
-  - key yang salah kehilangan bobot: `weight()` melewatkan key yang sedang
-    cooldown, sehingga router berhenti memilihnya dan setiap request tidak lagi
-    membayar kuota + latensi untuk satu percobaan yang pasti gagal;
-  - backoff eksponensial membatasi pemborosan kuota: laju tembak ulang turun cepat
-    dan terkunci pada maksimum satu percobaan per key per 60 detik;
-  - tidak ada state baru di key: `consecutiveFailures` per key sudah ada, dan
-    cooldown per apikey sudah identity-keyed sehingga terlihat di gauge
-    `kiseki_apikey_cooldown_seconds_remaining`.
-  - Cooldown tetap (mis. 30 s konstan) ditolak: laju pemborosan konstan lebih
-    tinggi dan tidak ada manfaat tambahan, karena salah konfigurasi tidak
-    menyembuhkan diri dengan menunggu.
-- **Tidak menambah `crossKeyFailures`** — tidak ikut memarkir provider.
-- **Tidak ada `markSuccess`** — panggilan tidak berhasil; kesehatan lain tidak
-  tersentuh. Kuota yang sudah dipotong tetap hangus.
+```ts
+/** Alasan cooldown yang sedang berlaku; undefined saat key tidak cooldown. */
+cooldownReason?: "misconfigured" | "unhealthy" | "rate_limited"
+```
+
+Aturan penulisannya — **penulis terakhir menjelaskan cooldown yang sedang
+berjalan**:
+
+- `markFailure(nowMs, reason)` bertambah parameter reason: `"unhealthy"` untuk
+  jalur 5xx/timeout/transport (nilai lama), `"misconfigured"` untuk jalur
+  kelas `misconfigured` dan `unauthorized` (401/403 dan 4xx non-JSON-RPC —
+  keduanya penolakan kunci/gateway, kelas masalah yang sama: konfigurasi).
+- `markRateLimited` mengisi `"rate_limited"`: 429 adalah pernyataan tentang
+  limit, bukan konfigurasi. Bila key yang sebelumnya ditolak karena konfigurasi
+  nanti kena 429, alasan cooldown yang berlaku berubah menjadi
+  `"rate_limited"` — dan sebaliknya, penolakan konfigurasi berikutnya
+  menimpa alasan 429/5xx. Kondisi `cooldownUntilMs` hanya pernah bertambah,
+  jadi alasan selalu menjelaskan cooldown terpanjang yang aktif; kalau label
+  meleset sesaat, key pertama yang pulih dicoba ulang dan balasannya
+  menulis ulang kebenarannya.
+- `markSuccess` menghapus alasan (dan `consecutiveFailures`, seperti sekarang):
+  key yang berhasil melayani bukan lagi key yang bermasalah.
+- Saat cooldown berakhir, alasan tidak perlu dihapus: kondisi turunan selalu
+  menguji `cooldownRemainingMs > 0` **dan** alasan, jadi alasan basi tanpa
+  cooldown tidak berpengaruh.
+
+Ini **koreksi atas draf sebelumnya** yang mengklaim "tidak ada state baru di
+key": ada satu field baru, dan ia hidup di `ApiKeyState` yang identity-keyed
+`(provider, token)` — artinya diagnosis otomatis terlihat oleh **setiap**
+instance chain yang mereferensikan key yang sama, bukan hanya instance yang
+melihat penolakannya.
+
+Cooldown-nya sendiri tidak berubah: eksponensial 1 s → 2 s → … maksimum 60 s,
+memakai `markFailure` yang sudah ada. Alasannya:
+
+- key yang salah kehilangan bobot: `weight()` melewatkan key yang sedang
+  cooldown, sehingga router berhenti memilihnya dan setiap request tidak lagi
+  membayar kuota + latensi untuk satu percobaan yang pasti gagal;
+- backoff eksponensial membatasi pemborosan kuota: laju tembak ulang turun cepat
+  dan terkunci pada maksimum satu percobaan per key per 60 detik;
+- cooldown per apikey sudah identity-keyed sehingga terlihat di gauge
+  `kiseki_apikey_cooldown_seconds_remaining`;
+- cooldown tetap (mis. 30 s konstan) ditolak: laju pemborosan konstan lebih
+  tinggi dan tidak ada manfaat tambahan, karena salah konfigurasi tidak
+  menyembuhkan diri dengan menunggu.
+
+Sisanya kebijakan attempt tidak berubah dari draf sebelumnya:
+
+- **Tidak menambah `crossKeyFailures`** — penolakan konfigurasi tidak ikut
+  memarkir provider.
+- **Tidak ada `markSuccess`** — panggilan tidak berhasil; kuota yang sudah
+  dipotong tetap hangus.
 - Failover ke key berikutnya: apikey yang salah tidak berarti key lain pada
   instance yang sama juga salah.
 - `RetryReason` bertambah `"misconfigured"`, terpisah dari `"server_error"`,
@@ -218,59 +261,82 @@ yang sama, dengan satu perbedaan label:
   `kiseki_pool_key_attempts_total`). Log warn menyebut status HTTP dan instance
   saja — **isi body tidak pernah masuk log**, karena body balasan gateway tidak
   dijamin bersih dari rahasia.
+- **Path `ambiguous` sendRaw tetap mencatat alasan**: untuk kelas
+  `misconfigured` pada grup `NON_IDEMPOTENT`, key yang menolak tetap
+  `markFailure(nowMs, "misconfigured")` sebelum outcome `ambiguous` dikembalikan
+  (lihat §6).
 
-Ketika semua key habis: jika ada kegagalan server sungguhan, jalur `sick` yang
-lama menang (konservatif, tidak berubah); jika attempt berjalan hanya
-`misconfigured` dan/atau `unauthorized` — keduanya penolakan kunci/gateway —
-pool mengembalikan outcome baru `{ kind: "misconfigured"; status? }` (§3) dan
-**menyimpan diagnosis** untuk request-request berikutnya (§4):
+### 3. Taksonomi: outcome `{ kind: "misconfigured"; status? }`, diturunkan dari kondisi key
 
-- `misconfiguredUntilMs` = waktu saat key pertama dapat mencoba lagi
-  (`earliestReadyAt()` pada saat itu). Selama window ini semua key diketahui
-  sedang cooldown, jadi "upstream salah konfigurasi" adalah pengetahuan yang
-  masih sah; setelah window berakhir upstream dicoba lagi secara normal, dan
-  siklus penolakan baru memperbarui diagnosis.
-- `status` = nomor status HTTP penolakan terakhir yang tercatat (mis. `401`,
-  `404`), murni untuk `data` error klien.
+`UpstreamOutcome` bertambah satu varian. Pool mengembalikannya hanya bila
+**setelah attempt selesai** kondisi turunan berlaku: **setiap** key instance
+sedang cooldown dengan `cooldownReason === "misconfigured"`. Kondisi yang sama
+yang menyalakan accessor adapter (§4) — satu definisi, dua konsumen. Bila
+kondisi tidak berlaku, pool berperilaku seperti hari ini: `sick` bila ada
+kegagalan server sungguhan pada attempt ini, selain itu `rate_limited` dengan
+`retryAtMs` = `earliestReadyAt()`.
 
-### 3. Taksonomi: outcome baru `{ kind: "misconfigured"; status? }`
+Konsekuensi dari syarat "setiap key" (dengan sengaja, sesuai semantik key):
 
-`UpstreamOutcome` bertambah satu varian. Router bereaksinya seperti
-`rate_limited`/`sick` — upstream ditandai sudah dicoba, loop lanjut ke kandidat
-berikutnya (apikey salah di satu upstream tidak berarti upstream lain gagal, jadi
-menghentikan routing di sini salah) — tetapi `lastEnd` item menerima alasan baru,
-`{ kind: "misconfigured"; status? }`, dan `onAttempt` melaporkan label
-`misconfigured` pada `kiseki_upstream_attempts_total`.
+- Key yang **tidak pernah dicoba** pada attempt ini (mis. gagal `canAfford`
+  karena bucket habis) tidak sedang cooldown dengan alasan konfigurasi → kondisi
+  gagal → pool mengembalikan `rate_limited` / `-32005`, karena key itu memang
+  akan pulih. Bukan `misconfigured`.
+- Key yang **sedang cooldown karena 5xx atau 429** dari request sebelumnya,
+  dicampur key yang ditolak 401 pada request ini → kondisi gagal (alasan
+  cooldown campur) → pool mengembalikan `rate_limited` (atau `sick` bila ada
+  kegagalan server pada attempt ini). Diagnosis konfigurasi tidak menyapu key
+  yang bermasalah karena kesehatan atau kapasitas.
+- Satu key salah + satu key sehat pada instance yang sama: request dilayani key
+  sehat, `markSuccess` berjalan, kondisi gagal — tidak ada diagnosis.
+
+`status` membawa nomor status HTTP penolakan terakhir yang terlihat attempt ini
+(mis. `401`, `404`), murni untuk `data` error klien.
+
+Router bereaksinya seperti `rate_limited`/`sick` — upstream ditandai sudah
+dicoba, loop lanjut ke kandidat berikutnya (apikey salah di satu upstream tidak
+berarti upstream lain gagal, jadi menghentikan routing di sini salah) — tetapi
+`lastEnd` item menerima alasan baru, `{ kind: "misconfigured"; status? }`, dan
+`onAttempt` melaporkan label `misconfigured` pada `kiseki_upstream_attempts_total`.
 
 Untuk grup `NON_IDEMPOTENT`, **kelas** `misconfigured` (4xx non-JSON-RPC yang
-terjadi selama attempt) diperlakukan `ambiguous` — lihat §6. Outcome
-`misconfigured` yang dikembalikan pool hanya tercapai lewat dua jalur: attempt
-READ yang semua key-nya menolak, dan attempt sendRaw yang semua key-nya menolak
-dengan 401/403 (yang per key tidak ambiguous). Kelas `unauthorized` untuk
-sendRaw tetap failover seperti hari ini (lihat Non-tujuan).
+terjadi selama attempt) diperlakukan `ambiguous` — lihat §6.
 
 ### 4. Kontrak adapter: satu accessor skalar baru
 
 `UpstreamAdapter` bertambah satu member:
 
 ```ts
-/** Diagnosis konfigurasi aktif, atau undefined. Skalar baca-saja. */
+/** Diagnosis konfigurasi aktif, diturunkan dari kondisi key. Skalar baca-saja. */
 misconfigured(): { untilMs: number; status?: number } | undefined
 ```
 
-- `createPoolAdapter` mengembalikannya dari state pool §2.
-- Implementasi lain dan fake adapter pada test router mengembalikan `undefined`
-  (tidak sedang salah konfigurasi); test yang membutuhkan menyetelnya lewat
-  injeksi.
+- Implementasinya di pool: aktif bila **setiap** key instance memenuhi
+  `cooldownRemainingMs(now) > 0 && cooldownReason === "misconfigured"`;
+  `untilMs` = cooldown yang **paling cepat berakhir** di antara key-key itu
+  (`min` atas `cooldownUntilMs`). Artinya begitu satu key pulih, diagnosis
+  terangkat dan key itu dicoba ulang secara normal — balasannya kemudian
+  menulis ulang kebenaran kondisinya.
+- `status` berasal dari penolakan terakhir yang tercatat pada attempt yang
+  menandai key (disimpan per pool sebagai pelengkap tampilan, bukan sumber
+  diagnosis; kondisi aktif/tidak selalu diturunkan dari key).
+- Karena `ApiKeyState` identity-keyed, instance chain lain yang memakai key
+  yang sama menurunkan diagnosis yang sama dari state bers itu — tanpa
+  menyimpan apa pun di pool-nya.
+- Implementasi lain dan fake adapter pada test router mengembalikan
+  `undefined` (tidak sedang salah konfigurasi); test yang membutuhkan
+  menyetelnya lewat injeksi.
 - Ini **koreksi atas draf sebelumnya**: kontrak adapter berubah — satu member
   baru, wajib untuk semua implementasi. Ia tetap konsisten dengan prinsip bahwa
   router hanya membaca skalar dari adapter dan tidak pernah menyentuh bucket
-  (invariant 8): accessor ini membaca state pool, bukan bucket, dan polanya sama
-  dengan `weight()` serta `earliestReadyAt()` yang sudah ada.
-- Alternatif "tidak menambah member, andalkan attempt() yang cepat-balik" ditolak:
-  router hanya memilih upstream dengan `weight > 0`, dan selama cooldown bobotnya
-  0 — `attempt()` tidak pernah dipanggil, jadi outcome apa pun yang dikembalikan
-  attempt tidak pernah sampai ke router. Tanpa accessor, router buta.
+  (invariant 8): accessor ini membaca kondisi kesehatan key, bukan isi bucket,
+  dan polanya sama dengan `weight()` serta `earliestReadyAt()` yang sudah ada.
+- Alternatif "snapshot diagnosis di pool" ditolak — lihat Alternatif #9.
+- Alternatif "tidak menambah member, andalkan attempt() yang cepat-balik"
+  ditolak: router hanya memilih upstream dengan `weight > 0`, dan selama
+  cooldown bobotnya 0 — `attempt()` tidak pernah dipanggil, jadi outcome apa
+  pun yang dikembalikan attempt tidak pernah sampai ke router. Tanpa accessor,
+  router buta.
 
 ### 5. Router: memilih, finalisasi, dan estimasi
 
@@ -285,13 +351,12 @@ masa diagnosis tidak menembak gateway sama sekali.
 **(b) Estimasi `Retry-After`.** `estimateRetryAfter` mengecualikan upstream yang
 `misconfigured()`-nya aktif, **dicek langsung pada adapter pada saat estimasi** —
 terlepas dari sumber pengetahuannya (outcome attempt pada request yang sama,
-atau sisa diagnosis request sebelumnya). Alasannya: menunggu tidak menyembuhkan
+atau kondisi turunan request sebelumnya). Alasannya: menunggu tidak menyembuhkan
 salah konfigurasi — cooldown kedaluwarsa, key dicoba ulang, penolakan yang sama
 terjadi — sehingga sisa cooldown upstream tersebut tidak boleh masuk angka;
 memasukkannya lewat `earliestReadyAt()` adalah kebohongan ke arah lain. Ini
 perluasan dari pengecualian `mismatched` yang sudah ada, dan kini berlaku pada
-request mana pun, bukan hanya pada request yang upstream-nya berujung
-`misconfigured`.
+request mana pun.
 
 **(c) Finalisasi.** Pemetaan `lastEnd` ke error (yang dipakai hanya ending
 terakhir):
@@ -307,8 +372,9 @@ ditambah satu aturan untuk finalisasi **tanpa attempt** (semua kandidat di-skip
 atau berbobot 0):
 
 > Bila item tidak punya ending attempt pada request ini dan **setiap** kandidat
-> tersisa (dikurangi yang mismatched) sedang `misconfigured`, item difinalisasi
-> `-32008` — dengan `data.status` dari accessor bila diketahui, tanpa estimasi.
+> tersisa (dikurangi yang mismatched) sedang salah konfigurasi menurut
+> accessor-nya, item difinalisasi `-32008` — dengan `data.status` dari accessor
+> bila diketahui, tanpa estimasi.
 
 Aturan ini yang menutup request-request berikutnya: satu upstream salah
 konfigurasi yang sedang cooldown → `200` / `-32008` tanpa fetch. Bila masih ada
@@ -322,8 +388,8 @@ di upstream lain (pada request yang sama) berujung `-32005` — item belum terbu
 mustahil, hanya upstream ini yang bermasalah konfigurasi, dan itu jawaban yang
 jujur.
 
-Error barunya dibangun di lapisan error proxy (kode `ERROR_UPSTREAM_MISCONFIGURED
-= -32008`):
+**Keputusan (disepakati):** kode error proxy barunya adalah **`-32008`**
+(`ERROR_UPSTREAM_MISCONFIGURED`), pesannya **"upstream is misconfigured"**:
 
 ```json
 {"code": -32008, "message": "upstream is misconfigured", "data": {"status": 404}}
@@ -348,16 +414,27 @@ membentuknya, gauge cooldown key, dan kode `-32008` yang diterima klien.
   sampai ke node; dari luar tidak bisa dibuktikan. Jaminan send-safe tidak
   melemah: tidak ada jalur baru yang menyatakan "request belum sampai ke node"
   tanpa bukti. Log warn `sendRaw ambiguous` memuat reason `misconfigured`
-  sehingga operator dapat melihat indikasi konfigurasi, tetapi klien tetap
-  menerima `-32007`.
+  sehingga operator dapat melihat indikasi konfigurasi, tetapi klien untuk
+  request sendRaw itu tetap menerima `-32007`.
+- **Alasan konfigurasi tetap dicatat di key meski outcome-nya ambiguous**: key
+  yang menolak menerima `markFailure(nowMs, "misconfigured")` sebelum outcome
+  `ambiguous` dikembalikan. Tanpa ini, request berikutnya selama cooldown akan
+  menerima `-32005` — salah diagnosis lagi. Karena loop attempt berhenti pada
+  penolakan pertama yang ambigu, diagnosis tingkat upstream menjadi aktif hanya
+  setelah **setiap** key instance pernah menolak dengan kelas ini; sampai saat
+  itu, key yang belum menolak dicoba seperti biasa (dan setiap penolakan
+  mencatat alasannya). Untuk instance satu key — bentuk umum Ankr — diagnosis
+  aktif sejak penolakan pertama.
 - **Kelas `unauthorized` (401/403) tetap failover antar key** seperti hari ini.
   Yang berubah adalah **hasil akhirnya ketika semua key menolak**: sebelumnya
   reason `server_error` menyalakan jalur `sick` → klien menerima `429` / `-32006`;
-  sesudahnya pool mengembalikan outcome `misconfigured` → router memfinalisasi
-  `-32008` dengan HTTP `200`. Ini perubahan yang disengaja dan diuji (Validasi
-  #6).
-- Request berikutnya selama masa diagnosis, untuk grup sendRaw pun, di-skip tanpa
-  fetch (§5a) dan difinalisasi `-32008` bila tidak ada kandidat lain (§5c).
+  sesudahnya kondisi turunan berlaku → outcome `misconfigured` → router
+  memfinalisasi `-32008` dengan HTTP `200`. Ini perubahan yang disengaja dan
+  diuji (Validasi #6).
+- Request berikutnya selama masa diagnosis, untuk grup sendRaw pun, di-skip
+  tanpa fetch (§5a) dan difinalisasi `-32008` bila tidak ada kandidat lain
+  (§5c). Ini send-safe: request yang di-skip tidak pernah dikirim, jadi tidak
+  ada ketidakpastian broadcast yang disembunyikan di balik `-32008`.
 
 ### 7. Apa yang dilihat klien dan operator
 
@@ -368,7 +445,8 @@ membentuknya, gauge cooldown key, dan kode `-32008` yang diterima klien.
 | Klien, READ, 401/403 | `429` + `-32006` (setelah provider parkir) | `200` + `-32008`, `data.status: 401/403` |
 | Klien, sendRaw, 4xx non-JSON-RPC | `-32007` | `-32007` (tidak berubah) |
 | Klien, sendRaw, 401/403, semua key menolak | `429` + `-32006` (jalur sick) | `200` + `-32008`; failover antar key tidak berubah |
-| Status HTTP respons | `429` + `Retry-After` palsu | `200` |
+| Klien, key lain belum dicoba / cooldown kesehatan atau 429 campur | `429` + `-32005` | tetap `429` + `-32005` (diagnosis tidak menyapu) |
+| Status HTTP respons | `429` + `Retry-After` palsu untuk kasus konfigurasi | `200` untuk kasus konfigurasi |
 | Log pool | "upstream failure"/"apikey rejected"/"sendRaw ambiguous" lalu "provider sick" | warn per key (status HTTP) tanpa parkir provider; sendRaw 4xx tetap warn ambiguous |
 | Metrik level 2 | `kiseki_pool_key_attempts_total{outcome="bad_body"|"server_error"}` | label baru `outcome="misconfigured"`; `unauthorized` tetap |
 | Metrik level 1 | `kiseki_upstream_attempts_total{outcome="sick"}` | label baru `outcome="misconfigured"`; finalisasi lewat sinyal pasif tidak menambah counter attempt |
@@ -421,16 +499,29 @@ menunjukkan key yang menolak sedang diistirahatkan.
    cooldown bobot upstream yang salah konfigurasi adalah 0, jadi `attempt()`
    tidak pernah dipanggil dan outcome apa pun tidak pernah sampai ke router.
    Inilah alasan accessor skalar (§4) diperlukan.
-9. **Sinyal diagnosis pasif menulis `lastEnd` seperti outcome.** Ditolak: pada
-   kasus campuran (satu upstream salah konfigurasi sedang cooldown + satu upstream
-   parkir karena `rate_limited`), itu memfinalisasi `-32008` padahal masih ada
-   kandidat yang akan bisa melayani — klien kehilangan `Retry-After` yang berguna.
-   Sinyal pasif bekerja lewat skip (§5a), pengecualian estimasi (§5b), dan aturan
-   finalisasi khusus (§5c) yang hanya berlaku bila tidak ada kandidat lain.
-10. **Retry diam-diam ke key berikutnya tanpa label/metric baru**. Ditolak:
+9. **Snapshot diagnosis di pool** (`misconfiguredUntilMs` diisi dari ringkasan
+   attempt terakhir). Ditolak, karena salah di tiga skenario: (i) key yang
+   ditolak dicampur key yang tidak pernah dicoba karena `canAfford` gagal —
+   snapshot menyatakan salah konfigurasi padahal key itu akan pulih, dan
+   jawabannya seharusnya `-32005`; (ii) key yang sedang cooldown karena 5xx/429
+   dari request sebelumnya dicampur key yang ditolak 401 — snapshot menyatakan
+   salah konfigurasi padahal sebabnya kesehatan atau kapasitas; (iii) cooldown
+   tersimpan di `ApiKeyState` per identitas dan dipakai bersama instance chain
+   lain, sedangkan snapshot per pool — key yang ditolak di instance ethereum
+   mendinginkan diri juga di instance base, tetapi pool base tidak punya
+   snapshot dan klien di base kembali menerima `429` / `-32005`. Mencatat alasan
+   di `ApiKeyState` dan menurunkan kondisi dari key memperbaiki ketiganya dengan
+   satu mekanisme.
+10. **Sinyal diagnosis pasif menulis `lastEnd` seperti outcome.** Ditolak: pada
+    kasus campuran (satu upstream salah konfigurasi sedang cooldown + satu upstream
+    parkir karena `rate_limited`), itu memfinalisasi `-32008` padahal masih ada
+    kandidat yang akan bisa melayani — klien kehilangan `Retry-After` yang berguna.
+    Sinyal pasif bekerja lewat skip (§5a), pengecualian estimasi (§5b), dan aturan
+    finalisasi khusus (§5c) yang hanya berlaku bila tidak ada kandidat lain.
+11. **Retry diam-diam ke key berikutnya tanpa label/metric baru**. Ditolak:
     menyembunyikan masalah; operator tidak mendapat sinyal apa pun dan kegagalan
     konfigurasi kembali menyamar.
-11. **Serahkan klasifikasi ke paket provider** lewat hook. Ditolak: klasifikasi
+12. **Serahkan klasifikasi ke paket provider** lewat hook. Ditolak: klasifikasi
     HTTP adalah tugas core; paket provider tidak boleh memuat klasifikasi HTTP
     (tabel tanggung jawab dalam pedoman repositori), dan aturan ini bukan
     kekhususan Ankr.
@@ -446,9 +537,13 @@ menunjukkan key yang menolak sedang diistirahatkan.
   dan 10 — `misconfigured` bukan keduanya, jadi tidak pernah memicu `429`).
 - `eth_sendRawTransaction` ambigu menghentikan kedua level (invariant 3) — hasil
   kelas `misconfigured` pada sendRaw juga ambigu.
+- Satu apikey = satu set bucket dan kesehatan, identity-keyed dan dipakai bersama
+  semua instance yang mereferensikannya — alasan cooldown kini bagian dari
+  identitas itu, bukan milik satu pool.
 - Router tidak pernah menyentuh bucket; ia hanya membaca skalar dari adapter
-  (invariant 8) — accessor `misconfigured()` adalah skalar baca-saja dari state
-  pool, pola yang sama dengan `weight()` dan `earliestReadyAt()`.
+  (invariant 8) — accessor `misconfigured()` adalah skalar baca-saja yang
+  diturunkan dari kondisi kesehatan key, pola yang sama dengan `weight()` dan
+  `earliestReadyAt()`.
 - Passthrough menang atas penemuan: jawaban node sah (termasuk 4xx ber-body JSON
   dengan `id: null` atau tanpa `id`) tidak diubah dan tidak di-retry.
 - Token tidak pernah muncul di log, metrik, pesan error, atau respons
@@ -459,9 +554,12 @@ menunjukkan key yang menolak sedang diistirahatkan.
 
 ## Dampak
 
-- **`upstream-core`**: `result.ts` (kelas `misconfigured` + uji bentuk body),
-  `pool.ts` (cabang `misconfigured`, cabang `unauthorized` berubah reason,
-  `RetryReason` baru, state diagnosis pool), `adapter.ts` (**satu member baru
+- **`upstream-core`**: `bucket.ts` (**`KeyHealth` bertambah field
+  `cooldownReason`**; `markFailure` bertambah parameter reason;
+  `markRateLimited` mengisi `"rate_limited"`; `markSuccess` menghapusnya),
+  `result.ts` (kelas `misconfigured` + uji bentuk body), `pool.ts` (cabang
+  `misconfigured`, cabang `unauthorized` berubah reason, `RetryReason` baru,
+  derivation kondisi dan `status` terakhir), `adapter.ts` (**satu member baru
   `misconfigured()` pada kontrak `UpstreamAdapter`** — koreksi atas draf
   sebelumnya yang mengklaim kontrak tidak berubah), `types/outcome.ts` (varian
   outcome baru). Semua implementasi adapter dan fake adapter mengembalikan
@@ -504,21 +602,26 @@ menunjukkan key yang menolak sedang diistirahatkan.
    oleh kegagalan server dan penolakan konfigurasi, sehingga tangga backoff tidak
    membedakan penyebab. Mitigasi: keduanya sama-sama "key ini bermasalah, kurangi
    lajunya"; tangga yang lebih curam untuk key yang bermasalah adalah konservatif
-   dan hanya membatasi pemborosan, tidak pernah mengubah jawaban klien.
-5. **Diagnosis kedaluwarsa salah arah**: state `misconfiguredUntilMs` tertahan
-   paling lama 60 detik (batas cooldown key) dan kedaluwarsa sendiri; setelah itu
-   upstream dicoba lagi secara normal. Bila operator memperbaiki konfigurasi dan
-   instance dibangun ulang, diagnosis hilang bersama pool. Salah diagnosis yang
-   tertahan paling lama 60 detik, dan hanya berupa "upstream ini dilewati",
-   bukan jawaban palsu ke klien.
+   dan hanya membatasi pemborosan, tidak pernah mengubah jawaban klien. Alasan
+   cooldown sendiri selalu menjelaskan penolakan terakhir (penulis terakhir
+   menang), dan `cooldownUntilMs` hanya pernah bertambah, jadi label bisa sesaat
+   lebih luas dari cooldown yang menyebabkannya — key pertama yang pulih dicoba
+   ulang dan balasannya menulis ulang kebenarannya.
+5. **Diagnosis kedaluwarsa salah arah**: kondisi turunan otomatis terangkat saat
+   cooldown key pertama berakhir (paling lama 60 detik) dan saat key mana pun
+   berhasil melayani (`markSuccess`). Bila operator memperbaiki konfigurasi dan
+   instance dibangun ulang, kesehatan yang tersimpan di registry mengikuti
+   aturan reload yang sudah ada. Salah diagnosis yang tertahan paling lama 60
+   detik, dan hanya berupa "upstream ini dilewati", bukan jawaban palsu ke klien.
 6. **Batch campuran: sebagian item sudah terjawab di attempt sebelumnya pada
    request yang sama.** Mitigasi: outcome `misconfigured` dan sinyal pasif hanya
    menyentuh item yang belum terjawab, sama seperti reaksi
    `rate_limited`/`sick` sekarang.
 7. **Insiden `-32007` menjadi lebih sulit dihubungkan dengan akar konfigurasi**
    karena klien tidak melihat perbedaannya. Mitigasi: log warn `sendRaw
-   ambiguous` memuat reason `misconfigured`, dan metrik level-2 memakai label
-   `misconfigured`, sehingga operator tetap bisa menelusurinya.
+   ambiguous` memuat reason `misconfigured`, metrik level-2 memakai label
+   `misconfigured`, dan key yang menolak mencatat alasan konfigurasi sehingga
+   request berikutnya mendapat `-32008` — operator tetap bisa menelusurinya.
 
 ---
 
@@ -528,60 +631,66 @@ Semua test memakai harness injeksi (`fetchImpl` palsu, `now()` statis) tanpa
 jaringan, dan body HTML dikutip verbatim dari catatan riset *Ankr Advanced API*:
 
 1. **READ, 4xx non-JSON-RPC, request pertama** (HTML 404 nginx): key mendapat
-   cooldown eksponensial (bobotnya turun), `crossKeyFailures` tidak bertambah,
-   provider tidak sakit; failover ke key berikutnya; saat semua key menolak,
-   outcome `misconfigured` kembali ke router dan diagnosis tersimpan di pool.
-2. **READ, 401/403, request pertama**: sama seperti di atas — cooldown key ada,
-   `crossKeyFailures` tidak bertambah, provider tidak parkir; campuran
-   `misconfigured` + `unauthorized` menghasilkan outcome `misconfigured`, bukan
-   `sick`.
+   cooldown eksponensial dengan alasan konfigurasi (bobotnya turun),
+   `crossKeyFailures` tidak bertambah, provider tidak sakit; failover ke key
+   berikutnya; saat setiap key sudah menolak, outcome `misconfigured` kembali ke
+   router.
+2. **READ, 401/403, request pertama**: sama seperti di atas — cooldown key dengan
+   alasan konfigurasi, `crossKeyFailures` tidak bertambah, provider tidak parkir;
+   campuran `misconfigured` + `unauthorized` menghasilkan outcome
+   `misconfigured`, bukan `sick`.
 3. **Dua request berurutan dalam masa cooldown**: request kedua tidak memanggil
    `fetch` sama sekali, tidak memotong kuota, dan tetap menghasilkan `200` /
    `-32008` (bukan `429` / `-32005` dengan `Retry-After` sisa cooldown).
-4. **Kasus campuran selama cooldown**: upstream A salah konfigurasi yang sedang
+4. **Diagnosis tidak menyapu** (tiga skenario):
+   - key A ditolak, key B tidak pernah dicoba karena `canAfford` gagal (bucket
+     habis) → `429` / `-32005`, bukan `misconfigured`;
+   - key A sedang cooldown karena 5xx/429 dari request sebelumnya, key B ditolak
+     401 pada request ini → `429` / `-32005` (atau `sick` bila ada kegagalan
+     server pada attempt ini), bukan `misconfigured`;
+   - key ditolak pada instance satu chain, lalu request datang ke instance chain
+     lain yang memakai key (identitas) yang sama → instance kedua menurunkan
+     diagnosis yang sama dari state bers dan menjawab `-32008` tanpa fetch.
+5. **Satu key salah + satu key sehat pada instance yang sama**: request dilayani
+   key sehat (`markSuccess`), tidak ada diagnosis, upstream tidak di-skip.
+6. **Kasus campuran selama cooldown**: upstream A salah konfigurasi yang sedang
    cooldown + upstream B parkir karena `rate_limited` → item difinalisasi
    `-32005` dengan estimasi yang **tidak memakai cooldown A** (hanya dari B);
    bila semua kandidat sedang salah konfigurasi → `-32008` tanpa estimasi.
-5. **Router, kasus end-to-end**: satu upstream `misconfigured` + satu upstream
+7. **Router, kasus end-to-end**: satu upstream `misconfigured` + satu upstream
    sehat → item terjawab oleh upstream sehat; semua upstream `misconfigured` →
    klien menerima `-32008` dengan HTTP `200` dan tanpa `Retry-After`;
    `misconfigured` + `rate_limited` pada request yang sama → `-32005` dengan
    estimasi yang mengecualikan upstream `misconfigured`.
-6. **`eth_sendRawTransaction` + 4xx non-JSON-RPC**: outcome `ambiguous`, `-32007`,
-   kedua level berhenti; tidak ada retry. **`eth_sendRawTransaction` + 401/403**:
-   failover antar key tidak berubah, dan ketika semua key menolak hasilnya
-   berubah dari `sick` / `429` / `-32006` menjadi `200` / `-32008`.
-7. **4xx dengan body JSON-RPC valid**: perilaku tidak berubah — domain error
+8. **`eth_sendRawTransaction` + 4xx non-JSON-RPC**: outcome `ambiguous`, `-32007`,
+   kedua level berhenti; tidak ada retry; key yang menolak mencatat alasan
+   konfigurasi, dan request READ maupun sendRaw berikutnya dalam masa cooldown
+   dijawab `-32008` tanpa fetch. **`eth_sendRawTransaction` + 401/403**: failover
+   antar key tidak berubah, dan ketika setiap key sudah menolak hasilnya berubah
+   dari `sick` / `429` / `-32006` menjadi `200` / `-32008`.
+9. **4xx dengan body JSON-RPC valid**: perilaku tidak berubah — domain error
    diteruskan final, capability mismatch tetap regroup, termasuk amplop tunggal
    dengan `id: null` dan amplop tanpa `id`.
-8. **Kasus lama tidak berubah**: 429, 5xx, transport error, campuran dengan
-   `server_error` (jalur `sick` menang) — seluruh test lama lulus tanpa
-   pengecualian yang dibisukan.
-9. `bun run check` lulus penuh sebelum commit.
+10. **Kasus lama tidak berubah**: 429, 5xx, transport error, campuran dengan
+    `server_error` (jalur `sick` menang), serta pergantian alasan cooldown
+    (`markRateLimited` menimpa alasan konfigurasi dan sebaliknya) — seluruh test
+    lama lulus tanpa pengecualian yang dibisukan.
+11. `bun run check` lulus penuh sebelum commit.
 
 ---
 
 ## Pertanyaan terbuka
 
-- **Nama kode `-32008`**: tabel kode proxy sekarang berhenti di `-32007`
-  (`-32000`…`-32005` proxy, `-32006`, `-32007`). `-32008` melanjutkan rentang itu.
-  Usulan: `-32008`, karena maknanya berbeda dari `-32000` — `-32000` adalah kode
-  autentikasi klien ke kiseki (dan general internal proxy), sedangkan `-32008`
-  menandai penolakan yang berasal dari upstream, bukan dari klien maupun proxy
-  sendiri. Penolakan key oleh upstream tidak pernah menghasilkan `-32000` hari
-  ini, jadi `-32008` tidak menimpa makna yang sudah ada.
-- **Teks `message` `-32008`**: usulan "upstream is misconfigured". Kalau reviewer
-  ingin bahasa lain, cukup ganti satu konstanta.
-
-Tidak ada pertanyaan desain lain; sisanya mekanis.
+Tidak ada. Kode error (`-32008`) dan pesan (`"upstream is misconfigured"`) sudah
+disepakati dan menjadi keputusan di §5.
 
 ---
 
 ## Langkah selanjutnya
 
-1. Setelah disetujui: implementasikan sesuai proposal ini (core dulu — termasuk
-   member adapter baru — lalu router dan tabel kode error), dengan test pada
-   bagian Validasi.
+1. Setelah disetujui: implementasikan sesuai proposal ini (core dulu — alasan
+   cooldown di `ApiKeyState`, lalu pool, member adapter baru, router, dan tabel
+   kode error), dengan test pada bagian Validasi.
 2. Perbarui bagian *Penanganan error*, *Kesehatan dua level*, kontrak adapter,
    dan tabel kode proxy dalam perubahan yang sama.
 3. `bun run check` lulus penuh, lalu pindahkan proposal ini ke folder proposal
