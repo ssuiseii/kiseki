@@ -42,6 +42,17 @@ export type CoreDeps = {
   poolObserver?: PoolObserver
 }
 
+/**
+ * An active configuration diagnosis: every apikey of the instance was rejected
+ * by the gateway and is cooling down for that reason.
+ */
+export type MisconfiguredState = {
+  /** Epoch ms when the first key of the instance could serve again. */
+  untilMs: number
+  /** HTTP status of the last rejection, when the provider reported one. */
+  status?: number
+}
+
 export interface UpstreamAdapter {
   /** Instance name from config (unique globally, design.md §15.1 rule 3). */
   readonly name: string
@@ -53,6 +64,13 @@ export interface UpstreamAdapter {
   weight(): number
   /** Epoch ms when the first apikey could serve again; for Retry-After (§12.2). */
   earliestReadyAt(): number
+  /**
+   * Configuration diagnosis derived from key state, or undefined when the
+   * instance is not misconfigured. Read-only scalar: the router uses it to skip a
+   * doomed instance instead of paying quota for a request that is certain to be
+   * rejected (see "Kesehatan dua level" in ARCHITECTURE.md).
+   */
+  misconfigured(): MisconfiguredState | undefined
   attempt(group: Group, ctx: AttemptCtx): Promise<UpstreamOutcome>
 }
 

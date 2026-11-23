@@ -13,7 +13,12 @@
  * The router never sees any of this: it gets one `UpstreamOutcome`.
  */
 
-import type { CoreDeps, UpstreamAdapter, UpstreamInstanceConfig } from "./adapter"
+import type {
+  CoreDeps,
+  MisconfiguredState,
+  UpstreamAdapter,
+  UpstreamInstanceConfig,
+} from "./adapter"
 import { ApiKeyState, type BucketSpec } from "./bucket"
 import { buildLayeredCostResolver, type CostResolver, type CostTable } from "./cost"
 import type { CapabilityErrorMatcher } from "./capsig"
@@ -82,7 +87,7 @@ export type ApikeyPoolOptions = {
 }
 
 /** Why one key did not serve the group; drives the next iteration. */
-type RetryReason = "rate_limited" | "server_error"
+type RetryReason = "rate_limited" | "server_error" | "misconfigured"
 
 /**
  * One item as it will actually go upstream: `method`/`params` are already the
@@ -189,6 +194,40 @@ export class ApikeyPool {
 
   sickUntil(): number {
     return this.sickUntilMs
+  }
+
+  /**
+   * Configuration diagnosis derived from key state, never stored on the pool.
+   *
+   * The instance counts as misconfigured only when EVERY key is cooling down with
+   * `cooldownReason === "misconfigured"`. A key that was never tried (out of
+   * credit), or one cooling down for health or capacity, disqualifies the
+   * diagnosis: those keys will recover, so `-32005` with a Retry-After is the
+   * truthful answer, not `-32008`.
+   *
+   * Because `ApiKeyState` is identity-keyed, a chain instance sharing the same
+   * key derives the same diagnosis from the same state — nothing is snapshotted
+   * here, and a diagnosis formed on ethereum is visible on base.
+   */
+  misconfigured(): MisconfiguredState | undefined {
+    if (this.keys.length === 0) return undefined
+    const nowMs = this.options.deps.now()
+
+    let untilMs = Number.POSITIVE_INFINITY
+    let status: number | undefined
+    for (const key of this.keys) {
+      if (key.state.activeCooldownReason(nowMs) !== "misconfigured") return undefined
+      const remaining = key.state.cooldownRemainingMs(nowMs)
+      const keyUntilMs = nowMs + remaining
+      if (keyUntilMs < untilMs) {
+        untilMs = keyUntilMs
+        // The status belongs to the key that recovers first: that is the key whose
+        // next answer will re-derive the truth for the whole instance.
+        status = key.state.misconfiguredHttpStatus(nowMs)
+      }
+    }
+
+    return status === undefined ? { untilMs } : { untilMs, status }
   }
 
   /**
@@ -381,6 +420,15 @@ export class ApikeyPool {
       )
 
       if (ready.length === 0) {
+        // A configuration diagnosis outranks the capacity/health reading: when
+        // every key is parked because the gateway rejected it, waiting is not the
+        // answer and `sick` would park the provider for a `.env` problem.
+        const misconfigured = this.misconfigured()
+        if (misconfigured !== undefined) {
+          return misconfigured.status === undefined
+            ? { kind: "misconfigured" }
+            : { kind: "misconfigured", status: misconfigured.status }
+        }
         if (sawServerFailure) return { kind: "sick", retryAtMs: this.earliestReadyAt() }
         return {
           kind: "rate_limited",
@@ -400,6 +448,19 @@ export class ApikeyPool {
       if (result.reason === "rate_limited") {
         retryAtMs = Math.min(retryAtMs, key.state.readyAtMs(eligibility, now()))
         observer?.onKeyFailover?.(this.instance)
+        continue
+      }
+
+      if (result.reason === "misconfigured") {
+        // A rejected key is a configuration problem, not a sick provider: fail
+        // over to the next key (another key on the same instance may be fine), but
+        // never accumulate `crossKeyFailures` — that counter exists to park a
+        // provider whose HEALTH is failing.
+        observer?.onKeyFailover?.(this.instance)
+        logger.debug("key failover after configuration rejection", {
+          upstream: this.instance,
+          apikey: key.label,
+        })
         continue
       }
 
@@ -502,14 +563,45 @@ export class ApikeyPool {
       }
 
       case "unauthorized": {
-        key.state.markFailure(now())
+        // 401/403 is the gateway rejecting the key, not the provider being sick:
+        // same class of problem as a 4xx that never became a JSON-RPC answer.
+        key.state.markFailure(now(), "misconfigured", responseClass.status)
         observer?.onKeyAttempt?.(this.instance, key.label, "unauthorized")
         logger.warn("apikey rejected by provider", {
           upstream: this.instance,
           apikey: key.label,
+          status: responseClass.status,
           reason: responseClass.reason,
         })
-        return { stop: false, reason: "server_error" }
+        return { stop: false, reason: "misconfigured" }
+      }
+
+      case "misconfigured": {
+        // The body was not a JSON-RPC envelope, so no node ever answered this
+        // call. Never log the body: a gateway error page is not guaranteed to be
+        // free of secrets.
+        key.state.markFailure(now(), "misconfigured", responseClass.status)
+        if (nonIdempotent) {
+          // We cannot prove the request never reached the node, so the sendRaw
+          // contract still stops BOTH levels (invariant 3). The key keeps the
+          // configuration reason, so later requests during the cooldown get a
+          // truthful `-32008` instead of a phantom `-32005`.
+          observer?.onKeyAttempt?.(this.instance, key.label, "ambiguous")
+          logger.warn("sendRaw ambiguous", {
+            upstream: this.instance,
+            apikey: key.label,
+            status: responseClass.status,
+            reason: "misconfigured",
+          })
+          return { stop: true, outcome: { kind: "ambiguous" } }
+        }
+        observer?.onKeyAttempt?.(this.instance, key.label, "misconfigured")
+        logger.warn("upstream rejected the call as misconfigured", {
+          upstream: this.instance,
+          apikey: key.label,
+          status: responseClass.status,
+        })
+        return { stop: false, reason: "misconfigured" }
       }
 
       case "server_error": {
@@ -754,6 +846,7 @@ export const createPoolAdapter = (
     capability: () => ({ methods, archive: cfg.archive }),
     weight: () => pool.weight(),
     earliestReadyAt: () => pool.earliestReadyAt(),
+    misconfigured: () => pool.misconfigured(),
     attempt: (group, ctx) => pool.attempt(group, ctx),
   }
 }

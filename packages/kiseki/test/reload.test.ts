@@ -379,3 +379,168 @@ describe("fingerprints", () => {
     expect([...map.keys()].sort()).toEqual(["alchemy-base", "alchemy-ethereum"])
   })
 })
+
+describe("§19 — a configuration diagnosis does not survive a config fix", () => {
+  /** Park the key because the gateway rejected it, the way the pool would. */
+  const reject = (runtime: Runtime, provider: string, token: string, status = 404): void => {
+    runtime.bucketRegistry.peek(provider, token)!.markFailure(0, "misconfigured", status)
+  }
+
+  test("a changed instance's misconfigured cooldown is cleared", () => {
+    const current = build(configObject())
+    reject(current, "alchemy", "alchemy-a")
+
+    // A config fix: the URL was wrong, now it is right.
+    const { path } = configFile({
+      ...configObject(),
+      chains: {
+        ethereum: {
+          upstreams: [
+            {
+              ...configObject().chains.ethereum.upstreams[0]!,
+              url_template: "https://fixed.test/{apikey}",
+            },
+          ],
+        },
+      },
+    })
+    const result = reloadRuntime({
+      configPath: path,
+      env,
+      registry: buildRegistry(),
+      logger: silentLogger,
+      now: () => 0,
+      current,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const state = result.runtime.bucketRegistry.peek("alchemy", "alchemy-a")!
+    expect(state.cooldownRemainingMs(0)).toBe(0)
+    expect(state.activeCooldownReason(0)).toBeUndefined()
+    expect(state.health.misconfiguredStatus).toBeUndefined()
+    expect(state.health.consecutiveFailures).toBe(0)
+  })
+
+  test("the next request sends again instead of waiting out the cooldown", () => {
+    const current = build(configObject())
+    reject(current, "alchemy", "alchemy-a")
+
+    const { path } = configFile({
+      ...configObject(),
+      chains: {
+        ethereum: {
+          upstreams: [
+            {
+              ...configObject().chains.ethereum.upstreams[0]!,
+              url_template: "https://fixed.test/{apikey}",
+            },
+          ],
+        },
+      },
+    })
+    const result = reloadRuntime({
+      configPath: path,
+      env,
+      registry: buildRegistry(),
+      logger: silentLogger,
+      now: () => 0,
+      current,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const adapter = result.runtime.chainRuntime("ethereum")!.adapters[0]!
+    expect(adapter.misconfigured()).toBeUndefined()
+    expect(adapter.weight()).toBeGreaterThan(0)
+  })
+
+  test("a health cooldown on the same identity is left alone", () => {
+    const current = build(configObject())
+    const state = current.bucketRegistry.peek("alchemy", "alchemy-a")!
+    state.markFailure(0) // unhealthy, 1s
+
+    const { path } = configFile({
+      ...configObject(),
+      chains: {
+        ethereum: {
+          upstreams: [
+            {
+              ...configObject().chains.ethereum.upstreams[0]!,
+              url_template: "https://fixed.test/{apikey}",
+            },
+          ],
+        },
+      },
+    })
+    const result = reloadRuntime({
+      configPath: path,
+      env,
+      registry: buildRegistry(),
+      logger: silentLogger,
+      now: () => 0,
+      current,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const after = result.runtime.bucketRegistry.peek("alchemy", "alchemy-a")!
+    expect(after.cooldownRemainingMs(0)).toBe(1_000)
+    expect(after.activeCooldownReason(0)).toBe("unhealthy")
+  })
+
+  test("a 429 cooldown on the same identity is left alone", () => {
+    const current = build(configObject())
+    current.bucketRegistry.peek("alchemy", "alchemy-a")!.markRateLimited(0, 5_000)
+
+    const { path } = configFile({
+      ...configObject(),
+      chains: {
+        ethereum: {
+          upstreams: [
+            {
+              ...configObject().chains.ethereum.upstreams[0]!,
+              url_template: "https://fixed.test/{apikey}",
+            },
+          ],
+        },
+      },
+    })
+    const result = reloadRuntime({
+      configPath: path,
+      env,
+      registry: buildRegistry(),
+      logger: silentLogger,
+      now: () => 0,
+      current,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const after = result.runtime.bucketRegistry.peek("alchemy", "alchemy-a")!
+    expect(after.cooldownRemainingMs(0)).toBe(5_000)
+    expect(after.activeCooldownReason(0)).toBe("rate_limited")
+  })
+
+  test("an identity used only by an UNCHANGED instance keeps its diagnosis", () => {
+    const current = build(configObject())
+    reject(current, "alchemy", "alchemy-a")
+    reject(current, "alchemy", "alchemy-b")
+
+    // Nothing about this instance changed, so the reload carries the adapter and
+    // the diagnosis with it.
+    const { path } = configFile(configObject())
+    const result = reloadRuntime({
+      configPath: path,
+      env,
+      registry: buildRegistry(),
+      logger: silentLogger,
+      now: () => 0,
+      current,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.kept).toEqual(["alchemy-ethereum"])
+    const after = result.runtime.bucketRegistry.peek("alchemy", "alchemy-a")!
+    expect(after.cooldownRemainingMs(0)).toBe(1_000)
+    expect(after.activeCooldownReason(0)).toBe("misconfigured")
+  })
+})

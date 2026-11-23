@@ -227,3 +227,105 @@ describe("BucketRegistry identity sharing (decision #24)", () => {
     expect(rebuilt.credits(0)).toEqual([10, 100])
   })
 })
+
+describe("cooldown reason (misconfigured vs health vs capacity)", () => {
+  test("a key with no cooldown has no active reason", () => {
+    const state = new ApiKeyState("alchemy", "tok", specs, 0)
+    expect(state.activeCooldownReason(0)).toBeUndefined()
+    expect(state.misconfiguredHttpStatus(0)).toBeUndefined()
+  })
+
+  test("markFailure records the reason it was called with", () => {
+    const healthy = new ApiKeyState("alchemy", "tok", specs, 0)
+    healthy.markFailure(0)
+    expect(healthy.activeCooldownReason(0)).toBe("unhealthy")
+
+    const rejected = new ApiKeyState("alchemy", "tok", specs, 0)
+    rejected.markFailure(0, "misconfigured", 404)
+    expect(rejected.activeCooldownReason(0)).toBe("misconfigured")
+    expect(rejected.misconfiguredHttpStatus(0)).toBe(404)
+  })
+
+  test("markRateLimited labels the cooldown rate_limited and drops the status", () => {
+    const state = new ApiKeyState("alchemy", "tok", specs, 0)
+    state.markFailure(0, "misconfigured", 401)
+    state.markRateLimited(500, 5_000)
+    expect(state.activeCooldownReason(500)).toBe("rate_limited")
+    expect(state.misconfiguredHttpStatus(500)).toBeUndefined()
+  })
+
+  test("a later misconfigured rejection overwrites a rate_limited reason", () => {
+    const state = new ApiKeyState("alchemy", "tok", specs, 0)
+    state.markRateLimited(0, 5_000)
+    state.markFailure(1_000, "misconfigured", 403)
+    expect(state.activeCooldownReason(1_000)).toBe("misconfigured")
+    expect(state.misconfiguredHttpStatus(1_000)).toBe(403)
+  })
+
+  test("markSuccess clears the reason and the status", () => {
+    const state = new ApiKeyState("alchemy", "tok", specs, 0)
+    state.markFailure(0, "misconfigured", 404)
+    state.markSuccess()
+    expect(state.health.cooldownReason).toBeUndefined()
+    expect(state.health.misconfiguredStatus).toBeUndefined()
+  })
+
+  test("a stale reason without a cooldown is not reported as active", () => {
+    const state = new ApiKeyState("alchemy", "tok", specs, 0)
+    state.markFailure(0, "misconfigured", 404)
+    // The cooldown is over: the label no longer describes anything.
+    expect(state.activeCooldownReason(60_000)).toBeUndefined()
+    expect(state.misconfiguredHttpStatus(60_000)).toBeUndefined()
+  })
+
+  test("clearMisconfigured drops only the configuration diagnosis", () => {
+    const state = new ApiKeyState("alchemy", "tok", specs, 0)
+    state.markFailure(0, "misconfigured", 404)
+    expect(state.clearMisconfigured()).toBe(true)
+    expect(state.cooldownRemainingMs(0)).toBe(0)
+    expect(state.health.consecutiveFailures).toBe(0)
+    expect(state.health.cooldownReason).toBeUndefined()
+    expect(state.health.misconfiguredStatus).toBeUndefined()
+  })
+
+  test("clearMisconfigured leaves a health or capacity cooldown alone", () => {
+    const healthy = new ApiKeyState("alchemy", "tok", specs, 0)
+    healthy.markFailure(0)
+    expect(healthy.clearMisconfigured()).toBe(false)
+    expect(healthy.cooldownRemainingMs(0)).toBe(1_000)
+
+    const limited = new ApiKeyState("alchemy", "tok", specs, 0)
+    limited.markRateLimited(0, 5_000)
+    expect(limited.clearMisconfigured()).toBe(false)
+    expect(limited.cooldownRemainingMs(0)).toBe(5_000)
+  })
+})
+
+describe("BucketRegistry.clearMisconfigured (reload path)", () => {
+  test("clears only the identities it is given", () => {
+    const registry = new BucketRegistry(() => 0)
+    const a = registry.get("alchemy", "KEY_A", specs)
+    const b = registry.get("alchemy", "KEY_B", specs)
+    a.markFailure(0, "misconfigured", 401)
+    b.markFailure(0, "misconfigured", 401)
+
+    const cleared = registry.clearMisconfigured([{ provider: "alchemy", token: "KEY_A" }])
+    expect(cleared).toBe(1)
+    expect(a.cooldownRemainingMs(0)).toBe(0)
+    expect(b.cooldownRemainingMs(0)).toBe(1_000)
+  })
+
+  test("an unknown identity is skipped, not created", () => {
+    const registry = new BucketRegistry(() => 0)
+    expect(registry.clearMisconfigured([{ provider: "alchemy", token: "NOPE" }])).toBe(0)
+    expect(registry.size).toBe(0)
+  })
+
+  test("an identity with a health cooldown is not cleared", () => {
+    const registry = new BucketRegistry(() => 0)
+    const state = registry.get("alchemy", "KEY_A", specs)
+    state.markFailure(0)
+    expect(registry.clearMisconfigured([{ provider: "alchemy", token: "KEY_A" }])).toBe(0)
+    expect(state.cooldownRemainingMs(0)).toBe(1_000)
+  })
+})

@@ -8,6 +8,10 @@
  * | Parsed config              | replaced (that is the point)            |
  * | Bucket registry (identity) | KEPT — same identity, same credits      |
  * | Cooldowns (identity-keyed) | KEPT — they live on the same object     |
+ * | `misconfigured` cooldown   | CLEARED for identities of changed       |
+ * |                            | instances — the config change is the    |
+ * |                            | likely fix, so the stale diagnosis must |
+ * |                            | not hold a corrected instance back      |
  * | Runtime capability notes   | RESET (§19, explicit)                   |
  * | Metrics                    | KEPT — same registry, same counters     |
  * | Removed apikeys            | buckets dropped (`retain`)              |
@@ -193,12 +197,31 @@ export const reloadRuntime = (options: ReloadOptions): ReloadResult => {
   const rebuilt = [...after.keys()].filter((name) => !reusable.has(name))
   const kept = [...reusable.keys()]
 
+  // A `misconfigured` cooldown is the one piece of key state a config change is
+  // expected to fix: the rejection most likely came from this instance's own
+  // apikey or `url_template`. Keeping the stale cooldown would hold a now-correct
+  // instance back for up to a minute, so it is dropped for the identities the
+  // changed instances use. Health and capacity cooldowns still describe the
+  // provider after a config edit, so they stay.
+  const changed = new Set(rebuilt)
+  const changedIdentities: { provider: string; token: string }[] = []
+  for (const chain of Object.values(loaded.config.chains)) {
+    for (const upstream of chain.upstreams) {
+      if (!changed.has(upstream.name)) continue
+      for (const key of upstream.apikeys) {
+        changedIdentities.push({ provider: upstream.provider, token: key.token })
+      }
+    }
+  }
+  const clearedDiagnoses = runtime.bucketRegistry.clearMisconfigured(changedIdentities)
+
   logger.info("config reloaded", {
     chains: runtime.chains,
     added,
     removed,
     rebuilt,
     kept,
+    ...(clearedDiagnoses === 0 ? {} : { clearedMisconfigured: clearedDiagnoses }),
     warnings: loaded.warnings.length,
   })
 

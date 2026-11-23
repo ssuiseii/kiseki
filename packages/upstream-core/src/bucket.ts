@@ -25,11 +25,22 @@ export type Bucket = {
   lastRefillMs: number
 }
 
+/**
+ * Why a key is cooling down. The last writer explains the running cooldown: a
+ * `cooldownUntilMs` only ever grows, so the label always describes the longest
+ * cooldown in effect (see `markFailure` / `markRateLimited`).
+ */
+export type CooldownReason = "misconfigured" | "unhealthy" | "rate_limited"
+
 export type KeyHealth = {
   /** Epoch ms until which this key must not be used. */
   cooldownUntilMs: number
   /** Consecutive 5xx/timeout failures, drives exponential cooldown (§13). */
   consecutiveFailures: number
+  /** Reason for the cooldown in effect; undefined when the key is not cooling down. */
+  cooldownReason?: CooldownReason
+  /** HTTP status of the last rejection when `cooldownReason` is `misconfigured`. */
+  misconfiguredStatus?: number
 }
 
 /**
@@ -105,6 +116,23 @@ export class ApiKeyState {
     return Math.max(0, this.health.cooldownUntilMs - nowMs)
   }
 
+  /**
+   * The reason the key is cooling down right now, or undefined when it is ready.
+   *
+   * A stale label without a cooldown is ignored on purpose: the cooldown is the
+   * condition, the label only names it.
+   */
+  activeCooldownReason(nowMs: number): CooldownReason | undefined {
+    if (this.cooldownRemainingMs(nowMs) <= 0) return undefined
+    return this.health.cooldownReason
+  }
+
+  /** HTTP status of the last config-style rejection, while that reason is active. */
+  misconfiguredHttpStatus(nowMs: number): number | undefined {
+    if (this.activeCooldownReason(nowMs) !== "misconfigured") return undefined
+    return this.health.misconfiguredStatus
+  }
+
   /** Can this key serve `cost` right now? All buckets must afford it (§5.5 rule 5). */
   canAfford(cost: number, nowMs: number): boolean {
     if (this.cooldownRemainingMs(nowMs) > 0) return false
@@ -151,6 +179,10 @@ export class ApiKeyState {
   /** Success resets the failure streak (design.md §13). */
   markSuccess(): void {
     this.health.consecutiveFailures = 0
+    // A key that just served is no longer a problem key, so its cooldown label
+    // and status must not outlive the streak that produced them.
+    delete this.health.cooldownReason
+    delete this.health.misconfiguredStatus
   }
 
   /**
@@ -166,13 +198,26 @@ export class ApiKeyState {
     const estimate = this.readyAtMs(1, nowMs)
     const until = retryAtMs !== undefined && retryAtMs > nowMs ? retryAtMs : estimate
     this.health.cooldownUntilMs = Math.max(this.health.cooldownUntilMs, until)
+    // A 429 is a statement about the limit, not about the configuration, so it
+    // relabels the cooldown it extends.
+    this.health.cooldownReason = "rate_limited"
+    delete this.health.misconfiguredStatus
   }
 
   /**
    * 5xx / timeout / connection failure: exponential key cooldown
    * `1s → 2s → … cap 60s` (design.md §13).
+   *
+   * `misconfigured` uses the same ladder but names a different cause: the key
+   * (or the URL it was called with) was rejected, which is a configuration
+   * problem rather than a health problem. `status` is the HTTP status of that
+   * rejection, kept so the router can report it to the client.
    */
-  markFailure(nowMs: number): void {
+  markFailure(
+    nowMs: number,
+    reason: "unhealthy" | "misconfigured" = "unhealthy",
+    status?: number,
+  ): void {
     this.health.consecutiveFailures += 1
     const backoffMs = Math.min(
       60_000,
@@ -182,6 +227,30 @@ export class ApiKeyState {
       this.health.cooldownUntilMs,
       nowMs + backoffMs,
     )
+    this.health.cooldownReason = reason
+    if (reason === "misconfigured" && status !== undefined) {
+      this.health.misconfiguredStatus = status
+    } else {
+      delete this.health.misconfiguredStatus
+    }
+  }
+
+  /**
+   * Drop a `misconfigured` diagnosis and its cooldown, leaving every other
+   * reason untouched.
+   *
+   * Called from the reload path: a rejection for configuration reasons is most
+   * likely fixed by the config change itself, so keeping the old cooldown would
+   * hold a now-correct instance back for up to a minute. Health and capacity
+   * cooldowns are still true after a config edit, so they stay.
+   */
+  clearMisconfigured(): boolean {
+    if (this.health.cooldownReason !== "misconfigured") return false
+    this.health.cooldownUntilMs = 0
+    this.health.consecutiveFailures = 0
+    delete this.health.cooldownReason
+    delete this.health.misconfiguredStatus
+    return true
   }
 }
 
@@ -263,6 +332,26 @@ export class BucketRegistry {
     for (const key of [...this.states.keys()]) {
       if (!keep.has(key)) this.states.delete(key)
     }
+  }
+
+  /**
+   * Drop the `misconfigured` diagnosis of every identity in `identities`.
+   *
+   * The reload path calls this for the identities used by instances whose config
+   * changed: a rejection for configuration reasons is most likely fixed by that
+   * very change, so the stale cooldown must not keep holding the instance back.
+   * Identities with a health or capacity cooldown are left alone.
+   *
+   * Returns the identities that were actually cleared, for the reload log line.
+   */
+  clearMisconfigured(identities: Iterable<{ provider: string; token: string }>): number {
+    let cleared = 0
+    for (const identity of identities) {
+      const state = this.states.get(identityKey(identity.provider, identity.token))
+      if (state === undefined) continue
+      if (state.clearMisconfigured()) cleared += 1
+    }
+    return cleared
   }
 
   /** Snapshot for metrics / debugging. Never exposes tokens beyond their identity. */

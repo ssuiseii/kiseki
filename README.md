@@ -31,6 +31,16 @@ response, transparent to the client.
 with a realistic `Retry-After` estimate, so client-side backoff doesn't have to
 be guesswork.
 
+**A wrong apikey is not a capacity problem.** When a gateway rejects the call
+itself — `401`/`403`, or a `4xx` whose body is not a JSON-RPC answer at all, as
+Ankr does for a bad key — that is reported as a configuration problem: HTTP
+`200` with `-32008 upstream is misconfigured` (plus `data.status` when the
+gateway sent one), never a `429`. The offending key is still rested with the
+same exponential cooldown, and while every key of an instance is resting for
+that reason Kiseki skips the instance without spending quota or touching the
+gateway. Fix the config and `SIGHUP`: the diagnosis is dropped for the changed
+instance, so the first request after the reload uses it again.
+
 **Send-safe by default.** `eth_sendRawTransaction` gets special treatment: an
 ambiguous result (timeout or connection drop after the request reached the
 node, a 5xx, or a broken response body) stops failover for that transaction

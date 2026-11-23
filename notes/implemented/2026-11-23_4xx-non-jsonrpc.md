@@ -230,7 +230,7 @@ berjalan**:
   cooldown tidak berpengaruh.
 
 Ini **koreksi atas draf sebelumnya** yang mengklaim "tidak ada state baru di
-key": ada satu field baru, dan ia hidup di `ApiKeyState` yang identity-keyed
+key": ada dua field baru, dan keduanya hidup di `ApiKeyState` yang identity-keyed
 `(provider, token)` — artinya diagnosis otomatis terlihat oleh **setiap**
 instance chain yang mereferensikan key yang sama, bukan hanya instance yang
 melihat penolakannya.
@@ -439,13 +439,13 @@ membentuknya, gauge cooldown key, dan kode `-32008` yang diterima klien.
   reason `server_error` menyalakan jalur `sick` → klien menerima `429` / `-32006`;
   sesudahnya kondisi turunan berlaku → outcome `misconfigured` → router
   memfinalisasi `-32008` dengan HTTP `200`. Ini perubahan yang disengaja dan
-  diuji (Validasi #6).
+  diuji (Validasi #8).
 - Request berikutnya selama masa diagnosis, untuk grup sendRaw pun, di-skip
   tanpa fetch (§5a) dan difinalisasi `-32008` bila tidak ada kandidat lain
   (§5c). Ini send-safe: request yang di-skip tidak pernah dikirim, jadi tidak
   ada ketidakpastian broadcast yang disembunyikan di balik `-32008`.
 
-### 8. Reload: perbaikan konfigurasi berlaku segera untuk penolakan konfigurasi
+### 7. Reload: perbaikan konfigurasi berlaku segera untuk penolakan konfigurasi
 
 Cooldown kesehatan (5xx) dan 429 **tidak** disentuh reload — itu sinyal tentang
 provider yang masih benar setelah config diubah. Alasan `misconfigured` berbeda:
@@ -465,9 +465,9 @@ menahan instance yang sudah benar. Maka, saat reload:
 
 Efeknya: perbaikan `url_template` atau apikey yang salah berlaku pada request
 pertama setelah reload, tanpa menunggu sisa cooldown (maksimum 60 detik).
-Test-nya ada di Validasi #10.
+Test-nya ada di Validasi #11.
 
-### 7. Apa yang dilihat klien dan operator
+### 8. Apa yang dilihat klien dan operator
 
 | Permukaan | Sebelum | Sesudah |
 |---|---|---|
@@ -588,7 +588,11 @@ menunjukkan key yang menolak sedang diistirahatkan.
 - **`upstream-core`**: `bucket.ts` (**`KeyHealth` bertambah field
   `cooldownReason` dan `misconfiguredStatus`**; `markFailure` bertambah
   parameter reason; `markRateLimited` mengisi `"rate_limited"`; `markSuccess`
-  menghapusnya), `result.ts` (kelas `misconfigured` + uji bentuk body),
+  menghapusnya; **operasi baru di `ApiKeyState`/`BucketRegistry` untuk menghapus
+  alasan `misconfigured`** — alasan, `misconfiguredStatus`, cooldown, dan
+  `consecutiveFailures` di-reset, sementara alasan `unhealthy`/`rate_limited`
+  tidak disentuh — dipanggil dari jalur reload `kiseki`), `result.ts` (kelas
+  `misconfigured` + uji bentuk body),
   `pool.ts` (cabang `misconfigured`, cabang `unauthorized` berubah reason,
   `RetryReason` baru, derivation kondisi), `adapter.ts` (**satu member baru
   `misconfigured()` pada kontrak `UpstreamAdapter`** — koreksi atas draf
@@ -598,14 +602,15 @@ menunjukkan key yang menolak sedang diistirahatkan.
 - **`kiseki`**: `errors.ts` (kode `-32008`), `router/index.ts` (`EndReason` baru,
   skip upstream ber-sinyal, pemetaan `lastEnd`, aturan finalisasi tanpa attempt,
   pengecualian estimasi), jalur reload (pembersihan alasan `misconfigured` untuk
-  identitas instance yang berubah, §8), `test/helpers.ts` (fake adapter menambah
-  member baru, default tidak aktif; test yang membutuhkan menyetelnya lewat
-  injeksi), tanpa perubahan server/pipeline — `shapeResponse` sudah benar
-  karena flag kapasitas tidak di-set.
+  identitas instance yang berubah lewat operasi baru di `BucketRegistry`, §7),
+  `test/helpers.ts` (fake adapter menambah member baru, default tidak aktif; test
+  yang membutuhkan menyetelnya lewat injeksi), tanpa perubahan server/pipeline —
+  `shapeResponse` sudah benar karena flag kapasitas tidak di-set.
 - **Dokumentasi**: bagian *Penanganan error* (tabel reaksi outcome, tabel kode
   error proxy, aturan status HTTP), *Kesehatan dua level* (baris untuk
   `misconfigured` dan 401/403), kontrak adapter di bagian arsitektur yang
-  menjelaskannya, dan daftar *Invarian* tetap konsisten tanpa perubahan teks
+  menjelaskannya, *Reload dan state* (baris untuk pembersihan alasan
+  `misconfigured`), dan daftar *Invarian* tetap konsisten tanpa perubahan teks
   invariant — diperbarui dalam perubahan implementasi yang sama.
 - **Metrik**: satu label baru pada dua counter yang sudah ada; tidak ada metrik
   baru.
@@ -643,7 +648,7 @@ menunjukkan key yang menolak sedang diistirahatkan.
    cooldown key pertama berakhir (paling lama 60 detik) dan saat key mana pun
    berhasil melayani (`markSuccess`). Salah diagnosis yang tertahan paling lama
    60 detik, dan hanya berupa "upstream ini dilewati", bukan jawaban palsu ke
-   klien. Khusus perbaikan lewat reload, ada pembersihan lebih cepat — lihat §8.
+   klien. Khusus perbaikan lewat reload, ada pembersihan lebih cepat — lihat §7.
 6. **Batch campuran: sebagian item sudah terjawab di attempt sebelumnya pada
    request yang sama.** Mitigasi: outcome `misconfigured` dan sinyal pasif hanya
    menyentuh item yang belum terjawab, sama seperti reaksi
@@ -702,7 +707,7 @@ jaringan, dan body HTML dikutip verbatim dari catatan riset *Ankr Advanced API*:
      instance dengan URL benar menurunkan diagnosis yang sama dan juga menjawab
      `-32008` selama cooldown. Keduanya lognya membedakan: hanya instance yang
      salah URL yang mencatat warn penolakan; instance yang benar hanya skip
-     pasif. (Perilaku ini disengaja — lihat Risiko #7.)
+     pasif. (Perilaku ini disengaja — lihat Risiko #8.)
 5. **Satu key salah + satu key sehat pada instance yang sama**: request dilayani
    key sehat (`markSuccess`), tidak ada diagnosis, upstream tidak di-skip.
 6. **Kasus campuran selama cooldown**: upstream A salah konfigurasi yang sedang

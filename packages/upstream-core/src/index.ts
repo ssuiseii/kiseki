@@ -27,6 +27,7 @@ export type {
   AdapterFactory,
   Capability,
   CoreDeps,
+  MisconfiguredState,
   UpstreamAdapter,
   UpstreamInstanceConfig,
 } from "./adapter"
@@ -57,7 +58,7 @@ export {
 
 export { AdapterRegistry } from "./registry"
 
-export type { Bucket, BucketSpec, KeyHealth } from "./bucket"
+export type { Bucket, BucketSpec, CooldownReason, KeyHealth } from "./bucket"
 export { ApiKeyState, BucketRegistry, identityKey } from "./bucket"
 
 export type { CapabilityCap, CapabilityErrorMatcher } from "./capsig"

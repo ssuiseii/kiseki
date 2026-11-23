@@ -33,7 +33,13 @@ import {
 import type { Classified, MethodClass } from "../classify"
 import type { RequestItem } from "../batch"
 import type { UpstreamView } from "../capability"
-import { broadcastUnknown, capacityExhausted, methodUnsupported, noHealthyUpstream } from "../errors"
+import {
+  broadcastUnknown,
+  capacityExhausted,
+  methodUnsupported,
+  noHealthyUpstream,
+  upstreamMisconfigured,
+} from "../errors"
 
 /** Retry-After bounds from design.md §12.2. */
 export const RETRY_AFTER_FLOOR_MS = 500
@@ -68,6 +74,8 @@ export type EndReason =
   | { kind: "unsupported"; error: JsonRpcError }
   | { kind: "rate_limited"; retryAtMs: number }
   | { kind: "sick"; retryAtMs: number }
+  /** The upstream rejected the call as a configuration problem (`-32008`). */
+  | { kind: "misconfigured"; status?: number }
 
 /** One routable item plus its routing state across regroup rounds. */
 export type ItemState = {
@@ -267,13 +275,16 @@ const unanswered = (
  * Precedence is the design's, read literally:
  *  - the item's last ending was a proven capability mismatch → that provider
  *    error, verbatim (#36);
+ *  - the item's last ending was a configuration rejection → `-32008`, with no
+ *    estimate: waiting does not fix a wrong apikey;
  *  - the item's last ending was capacity/sickness (or it never got an attempt
  *    because every candidate had weight 0) → §12 fail fast with an estimate.
  *
  * "Last" matters: a mismatch followed by a rate-limited upstream means the item
  * is not proven impossible, only unavailable right now, and a Retry-After is the
  * truthful answer — the next request will skip the mismatching upstream because
- * of its runtime note.
+ * of its runtime note. For the same reason `misconfigured` followed by
+ * `rate_limited` elsewhere stays `-32005`: only one upstream is misconfigured.
  */
 const finalizeItem = (
   deps: RouterDeps,
@@ -295,6 +306,24 @@ const finalizeItem = (
       item: state.request,
       ok: false,
       error: methodUnsupported(deps.chain, state.request.method),
+    }
+  }
+
+  if (end?.kind === "misconfigured") {
+    return { item: state.request, ok: false, error: upstreamMisconfigured(end.status) }
+  }
+
+  // No attempt happened on this request (every candidate was skipped or had zero
+  // weight). When the only reason left is a configuration diagnosis, say so
+  // instead of handing out a Retry-After that would never come true.
+  if (end === undefined) {
+    const diagnosis = diagnosisFor(candidates, state.mismatched)
+    if (diagnosis.active) {
+      return {
+        item: state.request,
+        ok: false,
+        error: upstreamMisconfigured(diagnosis.status),
+      }
     }
   }
 
@@ -324,12 +353,43 @@ const finalizeItem = (
 }
 
 /**
+ * The configuration diagnosis shared by every remaining candidate.
+ *
+ * Only a unanimous diagnosis counts: one healthy candidate left means the item is
+ * merely waiting, not blocked by configuration. Mismatched upstreams are excluded
+ * for the same reason they are excluded from the estimate — they will never serve
+ * this item, so their state says nothing about the ones that might.
+ */
+const diagnosisFor = (
+  candidates: readonly UpstreamView[],
+  mismatched: ReadonlySet<string>,
+): { active: true; status?: number } | { active: false } => {
+  let seen = false
+  let status: number | undefined
+  for (const upstream of candidates) {
+    if (mismatched.has(upstream.name)) continue
+    const diagnosis = upstream.adapter.misconfigured()
+    if (diagnosis === undefined) return { active: false }
+    if (!seen) status = diagnosis.status
+    seen = true
+  }
+  if (!seen) return { active: false }
+  return status === undefined ? { active: true } : { active: true, status }
+}
+
+/**
  * design.md §12.2: `min over capable upstreams(max(earliestReadyAt(u), sisa_sick(u)))`.
  *
- * Only upstreams that could still serve this group count. Two kinds are excluded:
- * one the static matrix does not cover (already absent from `candidates`), and one
+ * Only upstreams that could still serve this group count. Three kinds are excluded:
+ * one the static matrix does not cover (already absent from `candidates`), one
  * that just proved a runtime mismatch — it will never help this item, so its
- * recovery time would only understate the real wait.
+ * recovery time would only understate the real wait — and one that is
+ * misconfigured right now. Waiting does not cure a wrong apikey: counting its
+ * cooldown would promise a retry that will only hit the same rejection.
+ *
+ * The misconfigured check reads the adapter at estimation time, so it covers both
+ * knowledge sources: an outcome from this request and a condition derived from
+ * state written by an earlier one.
  *
  * `retryAtByName` adds the outcome-provided estimate where the adapter gave one,
  * which is more accurate than the generic "cost 1" estimate that
@@ -345,6 +405,7 @@ const estimateRetryAfter = (
   let earliest = Number.POSITIVE_INFINITY
   for (const upstream of candidates) {
     if (mismatched.has(upstream.name)) continue
+    if (upstream.adapter.misconfigured() !== undefined) continue
     const readyAt = Math.max(
       upstream.adapter.earliestReadyAt(),
       retryAtByName.get(upstream.name) ?? 0,
@@ -434,6 +495,11 @@ const runGroup = async (deps: RouterDeps, plan: GroupPlan): Promise<GroupRun> =>
   for (;;) {
     const eligible = plan.eligible
       .filter((upstream) => !tried.has(upstream.name))
+      // A misconfigured instance is not an attempt: skipping it costs no quota and
+      // no fetch, and it stays out of `tried` (that set means "was attempted").
+      // This is what keeps the diagnosis truthful on every later request during
+      // the cooldown, without ever touching the gateway again.
+      .filter((upstream) => upstream.adapter.misconfigured() === undefined)
       .map((upstream) => ({ value: upstream, weight: upstream.adapter.weight() }))
       .filter((entry) => entry.weight > 0)
 
@@ -497,6 +563,24 @@ const runGroup = async (deps: RouterDeps, plan: GroupPlan): Promise<GroupRun> =>
           state.lastEnd = { kind: "sick", retryAtMs: outcome.retryAtMs }
         }
         logger.warn("upstream sick", { chain: deps.chain, upstream: chosen.name })
+        continue
+      }
+
+      case "misconfigured": {
+        // A rejected key points at one upstream's configuration, not at the
+        // others: move on like `rate_limited`, but leave the provider unparked.
+        for (const state of plan.items) {
+          if (finished.some((out) => out.item.originalIndex === state.request.originalIndex)) continue
+          state.lastEnd =
+            outcome.status === undefined
+              ? { kind: "misconfigured" }
+              : { kind: "misconfigured", status: outcome.status }
+        }
+        logger.warn("upstream misconfigured", {
+          chain: deps.chain,
+          upstream: chosen.name,
+          ...(outcome.status === undefined ? {} : { status: outcome.status }),
+        })
         continue
       }
 

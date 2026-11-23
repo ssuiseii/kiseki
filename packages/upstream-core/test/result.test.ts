@@ -24,6 +24,14 @@ const response = (status: number, body: string, headers?: Record<string, string>
   latencyMs: 1,
 })
 
+/**
+ * Verbatim from the Ankr research note ("apikey salah"): HTTP 404, `text/html`,
+ * not JSON at all. Copied character for character so the classification test
+ * asserts against the real gateway answer.
+ */
+export const ANKR_HTML_404 =
+  "<html><head><title>404 Not Found</title></head>\n<body><center><h1>404 Not Found</h1></center><hr><center>nginx</center></body></html>"
+
 describe("classifyResponse (design.md §11.2, rows 1–2, 6–7)", () => {
   test("2xx with a body is ok", () => {
     expect(classifyResponse(response(200, '{"jsonrpc":"2.0","id":1,"result":"0x1"}'), 0)).toEqual({
@@ -46,6 +54,7 @@ describe("classifyResponse (design.md §11.2, rows 1–2, 6–7)", () => {
     expect(classifyResponse(response(401, ""), 0)).toEqual({
       kind: "unauthorized",
       reason: "http 401",
+      status: 401,
     })
     expect(classifyResponse(response(403, ""), 0).kind).toBe("unauthorized")
   })
@@ -55,8 +64,32 @@ describe("classifyResponse (design.md §11.2, rows 1–2, 6–7)", () => {
     expect(classifyResponse(response(503, ""), 0).kind).toBe("server_error")
   })
 
-  test("other 4xx is a client_error", () => {
-    expect(classifyResponse(response(400, ""), 0)).toEqual({ kind: "client_error", status: 400 })
+  test("other 4xx with a JSON-RPC envelope is a client_error", () => {
+    expect(
+      classifyResponse(response(400, '{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad params"}}'), 0),
+    ).toEqual({ kind: "client_error", status: 400 })
+  })
+
+  test("other 4xx without a JSON-RPC envelope is misconfigured", () => {
+    // Verbatim from the Ankr research note, "apikey salah": HTTP 404, text/html.
+    expect(classifyResponse(response(404, ANKR_HTML_404), 0)).toEqual({
+      kind: "misconfigured",
+      status: 404,
+    })
+  })
+
+  test("an empty 4xx body is misconfigured, not a JSON-RPC answer", () => {
+    expect(classifyResponse(response(400, ""), 0)).toEqual({ kind: "misconfigured", status: 400 })
+  })
+
+  test("a JSON primitive on 4xx is misconfigured (not object/array shaped)", () => {
+    for (const body of ['"null"', "null", "42", '"oops"']) {
+      expect(classifyResponse(response(404, body), 0)).toEqual({ kind: "misconfigured", status: 404 })
+    }
+  })
+
+  test("an array body on 4xx stays a client_error", () => {
+    expect(classifyResponse(response(400, "[]"), 0)).toEqual({ kind: "client_error", status: 400 })
   })
 
   test("empty 2xx body is a server_error, not a success", () => {

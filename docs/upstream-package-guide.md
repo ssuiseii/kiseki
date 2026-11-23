@@ -63,9 +63,18 @@ export interface UpstreamAdapter {
   capability(): Capability
   weight(): number
   earliestReadyAt(): number
+  misconfigured(): { untilMs: number; status?: number } | undefined
   attempt(group: Group, ctx: AttemptCtx): Promise<UpstreamOutcome>
 }
 ```
+
+`misconfigured()` adalah diagnosis konfigurasi yang diturunkan dari kondisi key:
+aktif hanya bila **setiap** key instance sedang cooldown dengan alasan
+`misconfigured`. `createPoolAdapter` sudah menyediakannya, jadi package provider
+tidak perlu menulis apa pun; package yang membangun adapter sendiri wajib
+mengembalikan `undefined` bila tidak punya diagnosis. Router memakainya untuk
+melewati instance yang pasti ditolak gateway tanpa memotong kuota, dan untuk
+mengecualikan instance itu dari estimasi `Retry-After`.
 
 Aturan dependensi — hafalkan ini:
 
@@ -245,7 +254,9 @@ Yang **tidak perlu** ditulis di package provider (semua sudah di engine):
 - pemilihan apikey & weighted-random → `ApikeyPool`
 - potong kuota sinkron sebelum fetch, per item batch → `ApikeyPool`
 - cooldown & health per apikey/provider → `ApikeyPool`
-- klasifikasi HTTP 429/5xx/timeout/batch → `classifyResponse`/`classifyBody`
+- diagnosis konfigurasi (`misconfigured`) dan `misconfigured()` → `ApikeyPool`
+- klasifikasi HTTP 429/5xx/timeout/4xx ber-body JSON/4xx non-JSON/batch →
+  `classifyResponse`/`classifyBody`
 - URL dari `{apikey}` → otomatis dari `cfg.url_template`
 - timeout → `cfg.timeout_ms` atau timeout kelas metode dari classifier
 

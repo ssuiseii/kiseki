@@ -93,6 +93,7 @@ punya bagian rinci:
    request berikutnya tidak mengulang kesalahan yang sama (§4.2, §6.2).
 4. **Fail fast.** Tidak ada antrean. Ketika seluruh kandidat kehabisan kapasitas,
    klien menerima `429` dengan estimasi `Retry-After` yang masuk akal (§4.6, §6.4).
+   Salah konfigurasi bukan kapasitas: kasus itu dijawab `200` dengan `-32008`.
 5. **Send-safe.** `eth_sendRawTransaction` yang hasilnya ambigu menghentikan
    seluruh failover, sehingga tidak pernah ada klaim sukses dari upstream lain
    untuk transaksi yang mungkin sudah masuk mempool (§5.5, §6.1).
@@ -184,7 +185,7 @@ paket `kiseki`.
 |---|---|---|
 | `RequestItem` | parse → pipeline | Satu item JSON-RPC beserta `originalIndex`, `id`, `method`, `params` |
 | `Group` / `GroupItem` | router → adapter | Sekumpulan item yang berbagi tujuan, plus `needsArchive`, `idempotency`, `timeoutMs` |
-| `UpstreamOutcome` | adapter → router | Taksonomi hasil: `success`, `domain_error`, `unsupported`, `rate_limited`, `sick`, `ambiguous` |
+| `UpstreamOutcome` | adapter → router | Taksonomi hasil: `success`, `domain_error`, `unsupported`, `rate_limited`, `sick`, `misconfigured`, `ambiguous` |
 | `Entry` | adapter → router | Satu jawaban per item: `ok` dengan `result`, atau `error` dengan flag `final` |
 
 Router bereaksi terhadap `kind`, tidak pernah terhadap error mentah provider. Itu
@@ -204,9 +205,16 @@ paket provider:
 type AdapterFactory = (cfg: UpstreamInstanceConfig, deps: CoreDeps) => UpstreamAdapter
 ```
 
-Router hanya melihat empat anggota `UpstreamAdapter`: `capability()`, `weight()`,
-`earliestReadyAt()`, dan `attempt()` → `UpstreamOutcome`. Nama paket provider tidak
-pernah muncul di router, server, classifier, atau pipeline.
+Router hanya melihat lima anggota `UpstreamAdapter`: `capability()`, `weight()`,
+`earliestReadyAt()`, `misconfigured()`, dan `attempt()` → `UpstreamOutcome`. Nama
+paket provider tidak pernah muncul di router, server, classifier, atau pipeline.
+
+`misconfigured()` adalah skalar baca-saja berisi diagnosis konfigurasi yang
+diturunkan dari kondisi kesehatan key — bukan dari isi bucket — dengan pola yang
+sama seperti `weight()` dan `earliestReadyAt()`. Router memakainya untuk melewati
+instance yang pasti ditolak gateway tanpa memotong kuota, dan untuk mengecualikan
+instance itu dari estimasi `Retry-After`. Kontrak ini wajib bagi semua
+implementasi; adapter yang tidak punya diagnosis mengembalikan `undefined`.
 
 Hampir seluruh kebutuhan ditutup oleh `createPoolAdapter(cfg, deps, hooks)`.
 `AdapterHooks` (didefinisikan di `packages/upstream-core/src/pool.ts`) hanya berisi
@@ -222,7 +230,8 @@ diduplikasi di paket provider:
 | Pemilihan apikey dan weighted-random | `ApikeyPool` |
 | Pemotongan kuota sinkron sebelum fetch, tanpa refund | `ApikeyPool` |
 | Cooldown dan kesehatan per key maupun per provider | `ApikeyPool` |
-| Klasifikasi HTTP 429 / 5xx / timeout / body rusak | `classifyResponse`, `classifyBody` |
+| Diagnosis konfigurasi (`misconfigured`) dari kondisi key | `ApikeyPool` |
+| Klasifikasi HTTP 429 / 5xx / 4xx ber-body JSON / 4xx non-JSON | `classifyResponse`, `classifyBody` |
 | URL dari `{apikey}` | otomatis dari `cfg.url_template` |
 | Timeout | `cfg.timeout_ms` atau timeout kelas metode (§4.2) |
 | Iklan cakupan `kiseki_*` | diturunkan dari `methods:` dan tabel translasi (§4.8) |
@@ -407,9 +416,15 @@ diambil dari item terlambat, karena satu percobaan punya satu tenggat.
 terjawab atau terbukti tidak dapat dilayani.
 
 **Kelayakan dan pemilihan.** Kandidat sebuah item adalah
-`kandidat ∧ belum dicoba ∧ bobot > 0`. Status sakit tidak perlu diperiksa terpisah:
-adapter yang sedang sakit mengembalikan `sick` tanpa melakukan fetch, yang secara
-perilaku identik dengan menyaringnya.
+`kandidat ∧ belum dicoba ∧ bobot > 0 ∧ tidak sedang salah konfigurasi`. Status
+sakit tidak perlu diperiksa terpisah: adapter yang sedang sakit mengembalikan
+`sick` tanpa melakukan fetch, yang secara perilaku identik dengan menyaringnya.
+
+Instance yang `misconfigured()`-nya aktif dilewati **sebelum** pemilihan: tidak
+ada fetch, tidak ada pemotongan kuota, dan instance itu tidak ditandai `tried`
+karena tidak ada percobaan yang terjadi. Itulah yang membuat request kedua dan
+berikutnya selama masa diagnosis tidak menembak gateway sama sekali, sementara
+diagnosisnya tetap benar.
 
 Bobot adalah Σ headroom seluruh apikey pada instance tersebut (§5.2). Pemilihan
 dilakukan secara weighted-random atas total bobot, sehingga upstream dengan
@@ -444,12 +459,31 @@ Item yang tidak memiliki kandidat tersisa difinalisasi berdasarkan cara
 berakhirnya yang terakhir:
 
 - berakhir karena mismatch kapabilitas → error provider diteruskan apa adanya;
+- berakhir karena salah konfigurasi → `-32008`, tanpa estimasi: menunggu tidak
+  memperbaiki apikey atau `url_template` yang salah;
 - berakhir karena kapasitas atau kesehatan → fail fast dengan estimasi waktu.
 
+Aturan tambahan berlaku untuk finalisasi **tanpa attempt** — semua kandidat
+dilewati atau berbobot 0. Bila item tidak punya ending attempt pada request ini
+dan **setiap** kandidat tersisa (dikurangi yang mismatched) sedang salah
+konfigurasi menurut `misconfigured()`, item difinalisasi `-32008` dengan
+`data.status` bila diketahui, tanpa estimasi. Aturan ini yang menutup
+request-request berikutnya selama cooldown. Bila masih ada kandidat yang tidak
+salah konfigurasi, jalur lama berjalan dan klien menerima `Retry-After` yang
+berguna, bukan `-32008` yang menyiratkan semuanya rusak.
+
+Semantik "ending terakhir" tetap literal: `misconfigured` diikuti `rate_limited`
+di upstream lain pada request yang sama berujung `-32005`, karena item itu belum
+terbukti mustahil.
+
 Estimasi diambil dari `min` atas seluruh kandidat yang masih relevan dari
-`max(earliestReadyAt(upstream), retryAt dari outcome)`. Upstream yang sudah terbukti
-mismatch dikecualikan: upstream itu tidak akan pernah melayani item tersebut,
-sehingga menyertakannya hanya akan membuat estimasi terlalu optimistis.
+`max(earliestReadyAt(upstream), retryAt dari outcome)`. Dua jenis upstream
+dikecualikan: yang sudah terbukti mismatch — upstream itu tidak akan pernah
+melayani item tersebut, sehingga menyertakannya hanya akan membuat estimasi
+terlalu optimistis — dan yang `misconfigured()`-nya aktif saat estimasi dihitung.
+Pengecualian kedua berlaku pada request mana pun, terlepas dari sumber
+pengetahuannya: menunggu tidak menyembuhkan salah konfigurasi, jadi sisa cooldown
+upstream itu tidak boleh masuk angka.
 
 Nilai akhirnya dijepit ke rentang 500 ms – 30.000 ms. Untuk batch, estimasi yang
 dipakai adalah nilai terbesar di antara item yang kelaparan, agar retry tidak
@@ -611,20 +645,40 @@ menolaknya.
 
 | Kejadian | Efek |
 |---|---|
-| Sukses | Reset hitungan kegagalan berurutan pada key |
-| `429` | Saldo semua bucket key didorong ke 0, key diparkir sampai refill |
-| `5xx` / timeout | Cooldown eksponensial per key: 1 s → 2 s → … maksimum 60 s |
+| Sukses | Reset hitungan kegagalan berurutan dan alasan cooldown pada key |
+| `429` | Saldo semua bucket key didorong ke 0, key diparkir sampai refill, alasan `rate_limited` |
+| `5xx` / timeout | Cooldown eksponensial per key: 1 s → 2 s → … maksimum 60 s, alasan `unhealthy` |
+| `401` / `403` | Cooldown eksponensial yang sama, alasan `misconfigured` + status HTTP; **tidak** menambah kegagalan lintas-key |
+| 4xx ber-body non-JSON-RPC | Sama seperti `401`/`403`: penolakan gateway, alasan `misconfigured` + status |
+| 4xx ber-body JSON-RPC | Bukan kejadian kesehatan: isi body yang menentukan (domain error atau mismatch) |
 | Kegagalan pada sejumlah key berbeda | Seluruh provider diparkir dengan backoff eksponensial 1 s → 60 s |
 
 Ambang kegagalan lintas-key bersifat default dan tidak dikonfigurasi. Tujuannya
 membedakan "satu key bermasalah" dari "provider sedang bermasalah": yang pertama
 diselesaikan dengan failover, yang kedua dengan mengistirahatkan instance.
 
+Penolakan konfigurasi sengaja **tidak** masuk ke penghitung lintas-key: apikey
+yang salah (atau `url_template` yang salah) adalah masalah konfigurasi satu
+instance, bukan bukti bahwa provider sedang turun. Yang terjadi hanyalah failover
+ke key berikutnya dan cooldown per key, sehingga laju tembak ulang tetap dibatasi
+tetapi provider tidak diparkir. Ketika **setiap** key instance sedang cooldown
+dengan alasan `misconfigured`, pool mengembalikan outcome `misconfigured` dan
+router menjawab `-32008`; selama masih ada key yang belum dicoba, sedang cooldown
+karena kesehatan, atau sedang cooldown karena 429, diagnosis itu tidak aktif dan
+jawabannya tetap `-32005`/`-32006`.
+
+Alasan cooldown dicatat di `ApiKeyState`, yang identity-keyed `(provider, token)`.
+Karena itu diagnosis otomatis berlaku di setiap instance chain yang memakai key
+yang sama, tanpa state tambahan di pool: penulis terakhir menjelaskan cooldown
+yang sedang berjalan, dan label basi tanpa cooldown tidak berpengaruh.
+
 Level backoff provider tidak pernah turun; lihat §10.
 
 `429` adalah pernyataan tentang limit, bukan tentang kesehatan, sehingga cooldown-nya
 tidak eksponensial. Sebaliknya `5xx`, timeout, dan kegagalan koneksi adalah sinyal
-kesehatan dan memakai backoff eksponensial.
+kesehatan dan memakai backoff eksponensial. Penolakan konfigurasi memakai tangga
+eksponensial yang sama dengan kesehatan — keduanya berarti "key ini bermasalah,
+kurangi lajunya" — tetapi dengan alasan yang berbeda.
 
 ---
 
@@ -639,15 +693,25 @@ kesehatan dan memakai backoff eksponensial.
 | `unsupported` | Seluruh item grup masuk regroup; instance ditandai sudah dicoba |
 | `rate_limited` | Instance ditandai sudah dicoba, lanjut ke kandidat berikutnya |
 | `sick` | Sama seperti `rate_limited` |
+| `misconfigured` | Sama seperti `rate_limited`, tetapi alasan item menjadi `-32008` bila tidak ada kandidat lain; provider tidak diparkir |
 | `ambiguous` | Hentikan kedua level untuk grup tersebut; semua item grup yang belum terjawab menerima `-32007` |
 
 Pada level 2, `ambiguous` juga menghentikan seluruh pool: tidak ada key lain yang
 dicoba, karena hasil broadcast yang tidak diketahui tidak boleh diperkuat oleh klaim
 dari key lain.
 
-Penghentian ini berlaku per grup. Grup lain dalam request yang sama, termasuk item
-READ pada batch yang sama, tetap dirutekan seperti biasa karena kelas idempotensi
-adalah bagian dari kunci grup (§4.3).
+`misconfigured` pada level 2 berlaku ketika setiap key instance ditolak gateway
+(401/403 atau 4xx non-JSON-RPC). Key yang menolak tetap mendapat cooldown
+eksponensial dan tetap dibayar kuotanya, tetapi tidak menambah kegagalan
+lintas-key: yang salah adalah konfigurasi instance itu, bukan kesehatan provider.
+Untuk `eth_sendRawTransaction`, kelas `misconfigured` selama attempt tetap
+`ambiguous` — catatan riset tidak membuktikan penolakan gateway terjadi sebelum
+request sampai ke node — namun key yang menolak tetap mencatat alasannya, sehingga
+request berikutnya selama cooldown mendapat `-32008` alih-alih `-32005`.
+
+Penghentian `ambiguous` berlaku per grup. Grup lain dalam request yang sama,
+termasuk item READ pada batch yang sama, tetap dirutekan seperti biasa karena kelas
+idempotensi adalah bagian dari kunci grup (§4.3).
 
 ### 6.2 Sinyal mismatch kapabilitas
 
@@ -681,15 +745,21 @@ aslinya baru menjadi jawaban klien ketika tidak ada upstream tersisa (§4.6).
 | `-32005` | seluruh upstream rate-limited | proxy (fail fast) |
 | `-32006` | tidak ada upstream sehat | proxy (fail fast) |
 | `-32007` | status broadcast tidak diketahui | proxy (`sendRawTransaction`) |
+| `-32008` | upstream salah konfigurasi (apikey atau `url_template` ditolak gateway) | proxy (diagnosis konfigurasi) |
 | `-32600` | request bukan JSON-RPC 2.0 yang valid, parameter bernama, batch kosong, atau rute tidak dikenal | proxy |
 | `-32601` | metode tidak didukung atau diblokir kebijakan | proxy (pre-flight) |
 | `-32602` | chain tidak dikenal, atau parameter kanonik tidak valid | proxy |
 | `-32603` | kegagalan pemetaan namespace kanonik, atau transport translasi yang belum diimplementasi | proxy |
 | lainnya | error provider | diteruskan apa adanya |
 
+`-32008` membawa pesan `"upstream is misconfigured"` dan, bila gateway
+melaporkannya, `data.status` berisi nomor status HTTP penolakan terakhir. Nama
+instance **tidak pernah** masuk error klien: klien yang menerima `-32008` di
+instance lain menelusuri sumbernya lewat log, bukan lewat `data`.
+
 Prinsipnya: passthrough menang atas penemuan. Proxy hanya mengarang error untuk
-jawaban yang memang ia yang menulis — pre-flight, fail fast, broadcast ambigu, dan
-request yang rusak.
+jawaban yang memang ia yang menulis — pre-flight, fail fast, broadcast ambigu,
+diagnosis konfigurasi, dan request yang rusak.
 
 ### 6.4 Status HTTP
 
@@ -698,6 +768,11 @@ heuristik: **setiap** item dalam respons harus gagal karena kapasitas atau keseh
 Satu jawaban nyata — bahkan satu error provider — membuat statusnya `200`, karena
 klien punya sesuatu yang bisa ditindaklanjuti dan `Retry-After` menyeluruh akan
 menjadi kebohongan untuk item tersebut.
+
+Salah konfigurasi bukan kapasitas dan bukan kesehatan, sehingga `-32008` selalu
+dijawab HTTP `200` tanpa `Retry-After`: tidak ada janji waktu yang bisa dibuat
+dengan jujur untuk config yang tidak akan menyembuhkan dirinya sendiri. Dengan
+begitu aturan eksak di atas otomatis terpenuhi.
 
 Header `Retry-After` dikirim dalam detik bulat, dibulatkan ke atas, minimum 1.
 
@@ -816,9 +891,20 @@ ada koneksi yang terputus.
 | Konfigurasi ter-parse | Diganti |
 | Bucket registry (per identitas) | Dipertahankan — identitas sama, kredit sama |
 | Cooldown (per identitas) | Dipertahankan — hidup pada objek yang sama |
+| Cooldown beralasan `misconfigured` | Dihapus untuk identitas yang dipakai instance yang config-nya berubah |
 | Catatan kapabilitas runtime | Direset |
 | Metrics | Dipertahankan — registry dan counter yang sama |
 | Apikey yang dihapus | Bucket-nya dibuang |
+
+Cooldown kesehatan (5xx) dan 429 **tidak** disentuh reload: keduanya tetap benar
+setelah config diubah. Alasan `misconfigured` berbeda — kemungkinan besar
+penyebabnya ada di config instance itu sendiri (apikey atau `url_template`), jadi
+diagnosis lama justru menahan instance yang sudah diperbaiki. Saat reload, untuk
+setiap identitas `(provider, token)` yang dipakai instance yang config-nya berubah,
+alasan beserta `misconfiguredStatus` dihapus dan cooldown key itu dibatalkan
+(`cooldownUntilMs` kembali 0, `consecutiveFailures` di-reset). Identitas yang
+dipakai hanya oleh instance yang tidak berubah tidak tersentuh. Efeknya: perbaikan
+config berlaku pada request pertama setelah reload, tanpa menunggu sisa cooldown.
 
 Adapter juga dipertahankan bila konfigurasi instance-nya tidak berubah. Pool menyimpan
 daftar key dan cooldown tingkat provider, sehingga membangun ulang semua adapter pada
@@ -964,7 +1050,9 @@ belum seperti yang tersirat dari nama atau konfigurasinya.
 | **Pre-flight** | Pemeriksaan kapabilitas sebelum request dikirim; penolakan di sini tidak memotong kuota |
 | **Grup** | Sekumpulan item yang berbagi kandidat belum dicoba, kebutuhan arsip, dan kelas idempotensi |
 | **Regroup** | Mengembalikan item yang terbukti mismatch ke antrean untuk dicoba ke upstream lain pada request yang sama |
-| **Outcome** | Taksonomi hasil satu percobaan: `success`, `domain_error`, `unsupported`, `rate_limited`, `sick`, `ambiguous` |
+| **Outcome** | Taksonomi hasil satu percobaan: `success`, `domain_error`, `unsupported`, `rate_limited`, `sick`, `misconfigured`, `ambiguous` |
+| **Misconfigured** | Diagnosis konfigurasi: gateway menolak panggilan (401/403, atau 4xx yang bukan amplop JSON-RPC) sehingga tidak ada node yang menjawab. Bukan kapasitas, bukan kesehatan; dijawab `-32008` |
+| **Alasan cooldown** | `misconfigured`, `unhealthy`, atau `rate_limited` — label yang menjelaskan cooldown key yang sedang berjalan, disimpan di `ApiKeyState` |
 | **Fail fast** | Menolak dengan `429` dan estimasi waktu, bukan mengantre |
 | **Passthrough** | Meneruskan error provider apa adanya tanpa diterjemahkan atau di-retry |
 | **Namespace kanonik** | Namespace `kiseki_*` yang netral terhadap provider, diturunkan dari tabel translasi |

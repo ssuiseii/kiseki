@@ -10,6 +10,7 @@ import { parseRequest } from "../src/batch"
 import { buildTimeoutPolicy } from "../src/classify"
 import { toView } from "../src/capability"
 import { handle, type PipelineDeps } from "../src/pipeline"
+import { recordingLogger } from "./helpers"
 
 /**
  * Integration: the REAL level-2 pool (M1) behind the REAL pipeline (M3).
@@ -377,5 +378,333 @@ describe("integration: pool + pipeline", () => {
 
     // Two items, cost 1 each (generic package, no cost overrides).
     expect(bucketRegistry.peek("alchemy", "key-a")!.credits(0)).toEqual([98])
+  })
+})
+
+/**
+ * Ankr research note, section "apikey salah", quoted verbatim: HTTP 404 and this
+ * HTML page, `content-type: text/html`, not JSON at all.
+ */
+const ANKR_HTML_404 =
+  "<html><head><title>404 Not Found</title></head>\n<body><center><h1>404 Not Found</h1></center><hr><center>nginx</center></body></html>"
+
+const html404 = (): Response =>
+  new Response(ANKR_HTML_404, { status: 404, headers: { "content-type": "text/html" } })
+
+describe("integration: 4xx non-JSON-RPC through the real pool and pipeline", () => {
+  const read = (id: number) => parseRequest({ id, method: "eth_blockNumber", params: [] })
+
+  test("request one answers 200 / -32008 with data.status, never 429 / -32006", async () => {
+    const { pipeline } = stack({
+      upstreams: [instance("ankr-ethereum", "ankr", ["eth_*"], true)],
+      responder: () => html404(),
+      random: () => 0,
+    })
+
+    const result = await handle(pipeline, read(1))
+
+    expect(result.status).toBe(200)
+    expect(result.retryAfterMs).toBeUndefined()
+    expect((result.body as { error: { code: number; message: string; data?: unknown } }).error).toEqual({
+      code: -32008,
+      message: "upstream is misconfigured",
+      data: { status: 404 },
+    })
+  })
+
+  test("request two during the cooldown sends nothing and answers the same way (Validasi #3)", async () => {
+    const { pipeline, urls } = stack({
+      upstreams: [instance("ankr-ethereum", "ankr", ["eth_*"], true)],
+      responder: () => html404(),
+      random: () => 0,
+    })
+
+    await handle(pipeline, read(1))
+    expect(urls).toHaveLength(1)
+
+    const second = await handle(pipeline, read(2))
+
+    // No fetch at all: the diagnosis is passive, and no quota was spent.
+    expect(urls).toHaveLength(1)
+    expect(second.status).toBe(200)
+    expect(second.retryAfterMs).toBeUndefined()
+    expect((second.body as { error: { code: number } }).error.code).toBe(-32008)
+  })
+
+  test("a 401 from one upstream still lets a healthy one serve the item (Validasi #7)", async () => {
+    const broken = instance("broken-ethereum", "broken", ["eth_*"], true)
+    const healthy = instance("healthy-ethereum", "healthy", ["eth_*"], true)
+
+    const { pipeline, urls } = stack({
+      upstreams: [broken, healthy],
+      responder: (url, body) =>
+        url.includes("broken-ethereum")
+          ? new Response("", { status: 401 })
+          : answerAll(body, "0x2a"),
+      random: () => 0,
+    })
+
+    const result = await handle(pipeline, read(1))
+
+    expect(result.status).toBe(200)
+    expect((result.body as { result: unknown }).result).toBe("0x2a")
+    expect(urls).toHaveLength(2)
+  })
+
+  test("a misconfigured upstream plus a starved one answers 429 / -32005 (Validasi #6)", async () => {
+    const broken = instance("broken-ethereum", "broken", ["eth_*"], true)
+    const starved = instance("starved-ethereum", "starved", ["eth_*"], true)
+
+    const { pipeline } = stack({
+      upstreams: [broken, starved],
+      responder: (url, body) => {
+        if (url.includes("broken-ethereum")) return html404()
+        // Starved: a 429 with a hint the pipeline may quote back.
+        return new Response("", { status: 429, headers: { "retry-after": "2" } })
+      },
+      random: () => 0,
+    })
+
+    const result = await handle(pipeline, read(1))
+
+    // The last ending was capacity, and a candidate could still recover, so the
+    // honest answer is a Retry-After rather than a claim that everything is broken.
+    expect(result.status).toBe(429)
+    expect((result.body as { error: { code: number } }).error.code).toBe(-32005)
+  })
+
+  test("sendRaw with a 4xx non-JSON-RPC body stays -32007 and stops routing (Validasi #8)", async () => {
+    const a = instance("a-ethereum", "a", ["eth_*"], true)
+    const b = instance("b-ethereum", "b", ["eth_*"], true)
+
+    const { pipeline, urls } = stack({
+      upstreams: [a, b],
+      responder: () => html404(),
+      random: () => 0,
+    })
+
+    const result = await handle(
+      pipeline,
+      parseRequest({ id: 1, method: "eth_sendRawTransaction", params: ["0xdeadbeef"] }),
+    )
+
+    expect((result.body as { error: { code: number } }).error.code).toBe(-32007)
+    expect(urls).toHaveLength(1)
+  })
+
+  test("the next sendRaw during the cooldown is -32008 without a fetch (Validasi #8)", async () => {
+    const { pipeline, urls } = stack({
+      upstreams: [instance("a-ethereum", "a", ["eth_*"], true)],
+      responder: () => html404(),
+      random: () => 0,
+    })
+
+    await handle(
+      pipeline,
+      parseRequest({ id: 1, method: "eth_sendRawTransaction", params: ["0xdeadbeef"] }),
+    )
+    expect(urls).toHaveLength(1)
+
+    const second = await handle(
+      pipeline,
+      parseRequest({ id: 2, method: "eth_sendRawTransaction", params: ["0xdeadbeef"] }),
+    )
+
+    expect(urls).toHaveLength(1)
+    expect((second.body as { error: { code: number } }).error.code).toBe(-32008)
+  })
+
+  test("sendRaw with 401 on every key ends 200 / -32008, not 429 / -32006 (Validasi #8)", async () => {
+    const config: UpstreamInstanceConfig = {
+      ...instance("alchemy-ethereum", "alchemy", ["eth_*"], true),
+      apikeys: [
+        { token: "key-a", label: "a", buckets: [{ capacity: 10, refill_per_second: 1 }] },
+        { token: "key-b", label: "b", buckets: [{ capacity: 10, refill_per_second: 1 }] },
+      ],
+    }
+
+    const { pipeline, urls } = stack({
+      upstreams: [config],
+      responder: () => new Response("", { status: 401 }),
+      random: () => 0,
+    })
+
+    const result = await handle(
+      pipeline,
+      parseRequest({ id: 1, method: "eth_sendRawTransaction", params: ["0xdeadbeef"] }),
+    )
+
+    // Failover between keys is unchanged (both were tried)…
+    expect(urls).toHaveLength(2)
+    // …but the final answer is now a configuration diagnosis, not a capacity one.
+    expect(result.status).toBe(200)
+    expect((result.body as { error: { code: number } }).error.code).toBe(-32008)
+  })
+
+  test("4xx with a valid JSON-RPC body still passes the node answer through (Validasi #9)", async () => {
+    const { pipeline, urls } = stack({
+      upstreams: [instance("a-ethereum", "a", ["eth_*"], true)],
+      responder: (url, body) =>
+        json(
+          {
+            jsonrpc: "2.0",
+            id: (body as { id: unknown }).id,
+            error: { code: 3, message: "execution reverted" },
+          },
+          400,
+        ),
+      random: () => 0,
+    })
+
+    const result = await handle(
+      pipeline,
+      parseRequest({ id: 1, method: "eth_call", params: [{ to: "0xabc" }] }),
+    )
+
+    expect(result.status).toBe(200)
+    expect((result.body as { error: { code: number; message: string } }).error).toEqual({
+      code: 3,
+      message: "execution reverted",
+    })
+    expect(urls).toHaveLength(1)
+  })
+
+  test("an envelope with id null on a 4xx is still matched positionally (Validasi #9)", async () => {
+    const { pipeline } = stack({
+      upstreams: [instance("a-ethereum", "a", ["eth_*"], true)],
+      responder: () =>
+        json(
+          { jsonrpc: "2.0", id: null, error: { code: -32000, message: "nonce too low" } },
+          400,
+        ),
+      random: () => 0,
+    })
+
+    const result = await handle(
+      pipeline,
+      parseRequest({ id: 1, method: "eth_call", params: [{ to: "0xabc" }] }),
+    )
+
+    expect((result.body as { error: { code: number; message: string } }).error).toEqual({
+      code: -32000,
+      message: "nonce too low",
+    })
+  })
+})
+
+describe("integration: a 4xx JSON-RPC envelope keeps its full behaviour (Validasi #9)", () => {
+  test("a capability mismatch on a 4xx body still regroups to the next upstream", async () => {
+    const a = instance("a-ethereum", "a", ["eth_*", "trace_*"], true)
+    const b = instance("b-ethereum", "b", ["eth_*", "trace_*"], true)
+
+    const { pipeline, urls, notes } = stack({
+      upstreams: [a, b],
+      responder: (url, body) =>
+        url.includes("a-ethereum")
+          ? json(
+              {
+                jsonrpc: "2.0",
+                id: (body as { id: unknown }).id,
+                error: { code: -32601, message: "method not found" },
+              },
+              400,
+            )
+          : answerAll(body, "0xtraced"),
+      random: () => 0,
+    })
+
+    const result = await handle(
+      pipeline,
+      parseRequest({ id: 1, method: "trace_block", params: ["0x1"] }),
+    )
+
+    expect((result.body as { result: unknown }).result).toBe("0xtraced")
+    expect(urls).toHaveLength(2)
+    expect(notes.hasMethodNote("a-ethereum", "trace_block")).toBe(true)
+  })
+
+  test("an envelope without id on a 4xx is matched positionally for a single item", async () => {
+    const { pipeline } = stack({
+      upstreams: [instance("a-ethereum", "a", ["eth_*"], true)],
+      responder: () =>
+        json({ jsonrpc: "2.0", error: { code: -32000, message: "nonce too low" } }, 409),
+      random: () => 0,
+    })
+
+    const result = await handle(
+      pipeline,
+      parseRequest({ id: 1, method: "eth_call", params: [{ to: "0xabc" }] }),
+    )
+
+    expect((result.body as { error: { code: number; message: string } }).error).toEqual({
+      code: -32000,
+      message: "nonce too low",
+    })
+  })
+})
+
+describe("integration: one key, two chains, only one URL wrong (Validasi #4)", () => {
+  // Deliberately identical `provider:` so the two instances share ONE identity
+  // `(provider, token)` — the documented behaviour, not an accident.
+  const sharedKey = (name: string, url: string): UpstreamInstanceConfig => ({
+    name,
+    provider: "shared",
+    package: "generic",
+    url_template: url,
+    apikeys: [{ token: "one-token", label: "a", buckets: [{ capacity: 100, refill_per_second: 10 }] }],
+    methods: ["eth_*"],
+    archive: true,
+  })
+
+  test("the correct instance derives the same diagnosis and answers -32008 without a fetch", async () => {
+    const clock = () => 0
+    const { fetchImpl, urls } = makeFetch((url, body) =>
+      url.includes("wrong") ? html404() : answerAll(body, "0x2a"),
+    )
+    const bucketRegistry = new BucketRegistry(clock)
+    const { logger, records } = recordingLogger()
+    const deps = { bucketRegistry, logger, now: clock, fetchImpl }
+    const random = () => 0
+
+    const wrong = createPoolAdapter(sharedKey("wrong-chain", "https://wrong.test/{apikey}"), deps, { random })
+    const right = createPoolAdapter(sharedKey("right-chain", "https://right.test/{apikey}"), deps, { random })
+
+    const pipelineFor = (chain: string, adapter: typeof wrong): PipelineDeps => ({
+      chain,
+      upstreams: [toView({ config: { name: adapter.name, provider: adapter.provider }, adapter })],
+      notes: new RuntimeNotes(),
+      logger,
+      now: clock,
+      timeouts,
+      blockedMethods: [],
+      maxTotalAttempts: 0,
+      random,
+    })
+
+    const first = await handle(
+      pipelineFor("wrongchain", wrong),
+      parseRequest({ id: 1, method: "eth_blockNumber", params: [] }),
+    )
+    expect((first.body as { error: { code: number } }).error.code).toBe(-32008)
+    expect(urls).toHaveLength(1)
+
+    // The other chain never called out: the shared identity already carries the
+    // diagnosis, and the router skips the instance instead of spending quota.
+    const second = await handle(
+      pipelineFor("rightchain", right),
+      parseRequest({ id: 2, method: "eth_blockNumber", params: [] }),
+    )
+    expect(urls).toHaveLength(1)
+    expect((second.body as { error: { code: number } }).error.code).toBe(-32008)
+
+    // Traceability: only the instance that was actually rejected logged a warn.
+    const rejections = records.filter(
+      (record) => record.message === "upstream rejected the call as misconfigured",
+    )
+    expect(rejections).toHaveLength(1)
+    expect(rejections[0]!.fields?.upstream).toBe("wrong-chain")
+    // And the client never learns the instance name.
+    expect(JSON.stringify(second.body)).not.toContain("wrong-chain")
+    expect(JSON.stringify(second.body)).not.toContain("one-token")
   })
 })
