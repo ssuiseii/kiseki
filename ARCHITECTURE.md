@@ -208,18 +208,11 @@ Router hanya melihat empat anggota `UpstreamAdapter`: `capability()`, `weight()`
 `earliestReadyAt()`, dan `attempt()` → `UpstreamOutcome`. Nama paket provider tidak
 pernah muncul di router, server, classifier, atau pipeline.
 
-Hampir seluruh kebutuhan ditutup oleh `createPoolAdapter(cfg, deps, hooks)`, di mana
+Hampir seluruh kebutuhan ditutup oleh `createPoolAdapter(cfg, deps, hooks)`.
 `AdapterHooks` (didefinisikan di `packages/upstream-core/src/pool.ts`) hanya berisi
-kekhasan provider:
-
-| Hook | Untuk apa |
-|---|---|
-| `costs` | Tabel cost default provider — lapisan tengah pada resolusi cost (§5.3) |
-| `matchCapability` | Signature error khas provider, berlapis di atas tabel fallback generik (§6.2) |
-| `headers(token)` | Header tambahan per token, dipanggil pada tiap percobaan |
-| `countsBatchAsOne` | Provider yang menagih per panggilan HTTP, bukan per item (§5.3) |
-| `translations` | Tabel `kiseki_*` → metode provider asli (§4.8) |
-| `observer`, `random` | Seam untuk observability dan test; bukan untuk konfigurasi produksi |
+kekhasan provider: tabel cost default, signature error, header tambahan, akuntansi
+batch, dan tabel translasi `kiseki_*`. Referensi lengkap setiap hook dan langkah
+membuat paket provider ada di `docs/upstream-package-guide.md`.
 
 Pembagian tanggung jawabnya tegas, dan bagian yang sudah dijamin engine tidak boleh
 diduplikasi di paket provider:
@@ -235,25 +228,6 @@ diduplikasi di paket provider:
 | Iklan cakupan `kiseki_*` | diturunkan dari `methods:` dan tabel translasi (§4.8) |
 | Perhitungan cost item kanonik memakai nama metode upstream | `itemCost` di pool |
 | Error provider diteruskan apa adanya | engine, tanpa perubahan |
-
-Beberapa konsekuensi yang perlu diketahui sebelum menulis adapter:
-
-- **Cakupan kanonik diturunkan, bukan dikonfigurasi.** Metode `kiseki_*` hanya
-  diiklankan bila metode upstream di belakangnya tercakup `methods:` instance.
-  Menyempitkan `methods:` ikut menghapus metode kanonik.
-- **`transport: "http"` belum diimplementasi.** Entri dengan transport itu tidak
-  diiklankan di `capability()`; bila tetap terpanggil, engine menjawabnya sebagai
-  error final tanpa mengirim request. Hanya `"jsonrpc"` yang berjalan.
-- **`mapRequest` yang mengembalikan `undefined` berarti parameter klien tidak
-  valid**, bukan mismatch kapabilitas: item dijawab final tanpa fetch dan tanpa
-  regroup.
-- **`mapResponse` yang melempar error juga final**, karena mencoba upstream lain
-  tidak dapat memperbaiki fungsi pemetaan.
-- **Satu instance hanya punya satu `url_template`.** Provider yang melayani
-  namespace berbeda di endpoint berbeda membutuhkan instance terpisah dengan nilai
-  `provider:` yang berbeda, karena `provider:` adalah identitas bucket (§5.1).
-- **Metode yang tidak dikenal lapisan paket tetap jatuh ke lapisan cost global**,
-  jadi tabel provider tidak perlu mencakup semuanya (§5.3).
 
 ### 3.6 Autentikasi
 
@@ -284,7 +258,7 @@ valid — kalau tidak, niat operator akan terlewati secara diam-diam.
 
 ### 3.7 Observability
 
-#### 3.7.1 Metrik
+**Metrik**
 
 `packages/kiseki/src/observ/metrics.ts` menyatukan dua peran dalam satu objek:
 objek metrics **adalah** observer. Tidak ada lapisan adapter terpisah, sehingga
@@ -315,7 +289,7 @@ menggunakan hash FNV-1a yang stabil dan tidak dapat dibalik.
 Satu request batch yang memuat beberapa kelas metode dihitung sekali per kelas yang
 benar-benar ada, bukan diberi satu kelas "batch" yang dibuat-buat.
 
-#### 3.7.2 Log
+**Log**
 
 `packages/kiseki/src/observ/logger.ts` menulis satu objek JSON per baris ke stdout,
 sehingga `journalctl -o cat | jq` bekerja tanpa perlakuan khusus.
@@ -328,8 +302,7 @@ Tiga aturan ditegakkan secara struktural, bukan lewat disiplin review:
 2. **Tidak pernah ada parameter request.** Tidak ada jalur di sini yang
    menyerialkan body. Parameter hanya dapat dijangkau lewat flag opt-in
    `KISEKI_DEBUG_BODIES=1`, dan nilai yang lewat flag itu pun tetap mengalami
-   scrubbing. Saat ini tidak ada pemanggil yang mengaktifkannya, sehingga body
-   tidak pernah tercatat (§11).
+   scrubbing. Flag ini belum tersambung (§11).
 3. **Murah saat mati.** Level `debug` dibuang sebelum serialisasi, sehingga jalur
    panas hanya membayar satu perbandingan.
 
@@ -512,19 +485,36 @@ memetakan nama kanonik ke nama upstream beserta fungsi pemetaan parameter dan
 hasil. Router tidak berubah sama sekali: bagi router, `kiseki_*` hanyalah metode
 biasa yang kebetulan didukung sebagian provider.
 
-Dua keputusan penting:
+**Kontrak translasi.** Setiap entri tabel memiliki dua fungsi pemetaan:
+
+- `mapRequest(params, chain)` menerima parameter kanonik dari klien, yang selalu
+  berupa array posisional (§4.7). Hasilnya dikirim apa adanya sebagai `params`
+  JSON-RPC ke upstream, sehingga bentuknya mengikuti dokumentasi provider: array
+  posisional atau objek bernama. JSON-RPC 2.0 mengizinkan keduanya.
+- `mapResponse(result, params, chain)` menerima hasil sukses upstream, parameter
+  kanonik asli, dan nama chain, lalu mengembalikan hasil kanonik. Nama chain
+  diberikan oleh engine karena hasil kanonik wajib memuatnya, sementara respons
+  provider belum tentu menyertakannya.
+
+Keduanya adalah pemetaan bentuk murni, tanpa I/O dan tanpa cache.
+
+Keputusan penting:
 
 - **Cakupan diturunkan, bukan dikonfigurasi.** Metode kanonik hanya diiklankan bila
   metode upstream di belakangnya tercakup oleh daftar `methods:` instance. Jika
   operator mempersempit `methods:`, metode kanonik ikut hilang. Konsekuensinya
   cakupan bersifat per (provider × plan).
-- **Kegagalan pemetaan bukan mismatch kapabilitas.** Parameter kanonik yang tidak
-  valid adalah kesalahan klien: item dijawab langsung sebagai domain error tanpa
-  fetch dan tanpa regroup. Upstream-nya baik-baik saja; request-nya yang salah.
+- **Kegagalan pemetaan bukan mismatch kapabilitas.** `mapRequest` yang mengembalikan
+  `undefined` berarti parameter kanonik tidak valid, yaitu kesalahan klien: item
+  dijawab langsung sebagai domain error tanpa fetch dan tanpa regroup. Upstream-nya
+  baik-baik saja; request-nya yang salah.
+- **`mapResponse` yang melempar error juga final**, karena mencoba upstream lain
+  tidak dapat memperbaiki fungsi pemetaan.
 
 Error dari provider tidak pernah diterjemahkan; error tersebut diteruskan apa
 adanya, sesuai prinsip passthrough. Biaya item kanonik dihitung memakai nama metode
-upstream, sehingga tarif provider yang sebenarnya tetap berlaku.
+upstream, sehingga tarif provider yang sebenarnya tetap berlaku. Hanya transport
+`"jsonrpc"` yang berjalan saat ini (§11).
 
 ---
 
@@ -630,9 +620,7 @@ Ambang kegagalan lintas-key bersifat default dan tidak dikonfigurasi. Tujuannya
 membedakan "satu key bermasalah" dari "provider sedang bermasalah": yang pertama
 diselesaikan dengan failover, yang kedua dengan mengistirahatkan instance.
 
-Satu detail yang perlu diketahui: hitungan kegagalan lintas-key di-reset oleh
-keberhasilan, tetapi level backoff provider tidak pernah turun. Setelah beberapa kali
-sakit, cooldown provider akan selalu berada di batas atasnya, yaitu 60 detik.
+Level backoff provider tidak pernah turun; lihat §10.
 
 `429` adalah pernyataan tentang limit, bukan tentang kesehatan, sehingga cooldown-nya
 tidak eksponensial. Sebaliknya `5xx`, timeout, dan kegagalan koneksi adalah sinyal
@@ -651,11 +639,15 @@ kesehatan dan memakai backoff eksponensial.
 | `unsupported` | Seluruh item grup masuk regroup; instance ditandai sudah dicoba |
 | `rate_limited` | Instance ditandai sudah dicoba, lanjut ke kandidat berikutnya |
 | `sick` | Sama seperti `rate_limited` |
-| `ambiguous` | Hentikan kedua level; semua item yang belum terjawab menerima `-32007` |
+| `ambiguous` | Hentikan kedua level untuk grup tersebut; semua item grup yang belum terjawab menerima `-32007` |
 
 Pada level 2, `ambiguous` juga menghentikan seluruh pool: tidak ada key lain yang
 dicoba, karena hasil broadcast yang tidak diketahui tidak boleh diperkuat oleh klaim
 dari key lain.
+
+Penghentian ini berlaku per grup. Grup lain dalam request yang sama, termasuk item
+READ pada batch yang sama, tetap dirutekan seperti biasa karena kelas idempotensi
+adalah bagian dari kunci grup (§4.3).
 
 ### 6.2 Sinyal mismatch kapabilitas
 
@@ -874,14 +866,8 @@ salah satunya berarti melanggar arsitektur, bukan sekadar mengubah implementasi.
 
 ## 9. Keputusan desain
 
-Tabel ini tidak memakai nomor keputusan; rujuk barisnya berdasarkan judul. Kolom
-"alasan" dan "alternatif yang ditolak" hanya berisi apa yang memang tercatat —
-alasan diambil dari penjelasan bagian terkait, dan alternatif hanya diisi bila
-dokumen lama menyebutkan alternatif itu secara eksplisit. Sel yang berisi `—`
-berarti alternatifnya tidak pernah dicatat, bukan berarti tidak pernah
-dipertimbangkan. Alternatif yang tercatat berasal dari dua proposal yang sudah
-diimplementasi: *Namespace Kanonik `kiseki_*` untuk Method Non-Standar Provider*
-dan *Provider Ankr Advanced API*.
+Tabel ini tidak memakai nomor keputusan; rujuk barisnya berdasarkan judul. Sel
+berisi `—` berarti tidak ada alternatif yang tercatat.
 
 | Keputusan | Alasan | Alternatif yang ditolak |
 |---|---|---|
@@ -899,8 +885,6 @@ dan *Provider Ankr Advanced API*.
 | Cakupan `kiseki_*` diturunkan dari `methods:` instance | Cakupan per (provider × plan) cukup diatur dengan menyempitkan `methods:` atau mengurangi entri translasi | Cakupan yang dikonfigurasi terpisah |
 | Parameter kanonik tidak valid adalah domain error final | Upstream tidak bersalah; request-nya yang salah, sehingga regroup hanya akan membakar kuota | Regroup untuk kasus parameter tidak valid |
 | Dua instance dengan `provider:` berbeda untuk satuan limit yang berbeda | `provider:` adalah identitas bucket; jumlah bucket yang berbeda membangun ulang bucket dan menghapus pemakaian yang tercatat | Dua instance dengan identitas provider yang sama |
-| `params` upstream boleh berbentuk objek, mengikuti dokumentasi provider | JSON-RPC 2.0 mengizinkan array maupun objek; bentuk objek adalah kontrak resmi provider | Tetap mengirim array karena server kebetulan menerimanya |
-| Nilai di luar batas provider ditolak sebelum request dikirim | Setiap penolakan provider tetap memotong kuota penuh | Memotong batas secara diam-diam; membiarkan provider menolak |
 | Skema config strict | Typo tidak boleh diam-diam menghapus kapabilitas dan baru ketahuan sebagai capability mismatch di runtime | — |
 | Parse YAML sebelum interpolasi `${VAR}` | `${VAR}` di dalam komentar tidak boleh ikut disubstitusi | — |
 | Variabel environment yang hilang adalah error fatal | Proxy tidak boleh berjalan dengan key kosong | String kosong sebagai pengganti |
@@ -931,8 +915,9 @@ dikira bug saat membaca kode. Hal yang belum berfungsi ada di §11.
 - **Tanpa WebSocket dan tanpa subscription.** Hanya JSON-RPC lewat HTTP POST.
 - **Tanpa persistensi konfigurasi terakhir yang valid.** Setelah restart, berkas
   konfigurasi harus valid; tidak ada salinan cadangan yang dipakai otomatis.
-- **Backoff provider tidak pernah turun.** Setelah beberapa kali sakit, cooldown
-  provider selalu berada di batas atasnya (§5.5).
+- **Backoff provider tidak pernah turun.** Hitungan kegagalan lintas-key di-reset
+  oleh keberhasilan, tetapi level backoff provider tidak. Setelah beberapa kali
+  sakit, cooldown provider selalu berada di batas atasnya, yaitu 60 detik (§5.5).
 - **Kuota bulanan provider tidak dimodelkan.** Bucket mengatur laju, bukan kuota
   periodik. Bila provider menolak karena kuota periodik habis, kejadian itu terlihat
   sebagai error biasa, bukan sebagai `429` dari Kiseki.
@@ -983,6 +968,6 @@ belum seperti yang tersirat dari nama atau konfigurasinya.
 | **Fail fast** | Menolak dengan `429` dan estimasi waktu, bukan mengantre |
 | **Passthrough** | Meneruskan error provider apa adanya tanpa diterjemahkan atau di-retry |
 | **Namespace kanonik** | Namespace `kiseki_*` yang netral terhadap provider, diturunkan dari tabel translasi |
-| **Ambigu** | Hasil `eth_sendRawTransaction` yang tidak dapat dipastikan; menghentikan seluruh failover |
+| **Ambigu** | Hasil `eth_sendRawTransaction` yang tidak dapat dipastikan; menghentikan failover untuk grup tersebut |
 | **Fingerprint** | Sidik konfigurasi satu instance; dipakai memutuskan adapter boleh dipakai ulang saat reload |
 | **Scrubber** | Penyaring yang mengganti setiap kemunculan secret pada log dengan penanda redaksi |

@@ -17,7 +17,8 @@ sees none of this.
 
 **Quota that matches reality.** Providers count limits differently — RPS, RPM,
 CU/s. Kiseki models all of it as token buckets with lazy refill, deducted per
-batch item *before* the request goes out, with no refunds. Conservative by
+batch item (or per HTTP call, for providers that bill that way) *before* the
+request goes out, with no refunds. Conservative by
 design: better to shed load early than to burn a provider's trust.
 
 **Capability routing.** Not every upstream supports `trace_*`, `debug_*`, or
@@ -31,9 +32,13 @@ with a realistic `Retry-After` estimate, so client-side backoff doesn't have to
 be guesswork.
 
 **Send-safe by default.** `eth_sendRawTransaction` gets special treatment: an
-ambiguous result (timeout, 5xx after broadcast) stops *all* failover dead, so
-you never end up with "success from upstream two" for a transaction that may
-already be in the mempool.
+ambiguous result (timeout or connection drop after the request reached the
+node, a 5xx, or a broken response body) stops failover for that transaction
+dead, so you never end up with "success from upstream two" for a transaction
+that may already be in the mempool. The client gets `-32007 broadcast state
+unknown` instead, and decides for itself — for example by looking the
+transaction hash up — whether to resend the same signed transaction. Other
+items in the same batch are routed as usual.
 
 **One namespace for provider-specific APIs.** Providers expose their own
 non-standard methods (`ankr_getTokenTransfers`, `alchemy_getAssetTransfers`, …)
@@ -94,6 +99,11 @@ kiseki --config /etc/kiseki/kiseki.yaml
 | `--check` | validate the config and exit — handy before a systemd restart |
 | `--help, -h` | usage |
 
+| Environment variable | Meaning |
+|---|---|
+| `KISEKI_CONFIG` | config path, overridden by `--config` |
+| `KISEKI_LOG_LEVEL` | `debug`, `info`, `warn`, or `error` (default: `info`) |
+
 You can also develop without compiling: `bun run dev` from
 `packages/kiseki`, or `bun run --filter kiseki dev`.
 
@@ -137,13 +147,17 @@ automatic. Reload config live with `SIGHUP` — running buckets are preserved.
 ## Development
 
 ```bash
-bun test                  # everything
+bun run check             # typecheck + every test (what CI gates on)
+bun test                  # every test
 bun run test:core         # just upstream-core
+bun run test:kiseki       # just kiseki
 bun run typecheck         # tsc across all packages
 ```
 
-Tests are colocated per package and run without network access (fetch, clock
-and randomness are injected), so they're fast and deterministic.
+Tests are colocated per package and run without network access or secrets
+(fetch, clock and randomness are injected; the end-to-end and binary suites
+spawn their own mock upstream on `127.0.0.1`), so they're fast and
+deterministic.
 
 ### Adding a provider
 
@@ -187,29 +201,35 @@ you narrow `methods:`, the canonical method disappears with it.
 ## Project layout
 
 ```
-packages/
-├── kiseki/            # main: HTTP server, auth, router, batch pipeline
-├── upstream-core/     # the engine: adapter contract, ApikeyPool, buckets
-├── upstream-generic/  # config-driven fallback provider
-├── upstream-alchemy/  # thin provider: CU table + error signatures
-└── upstream-ankr/     # thin provider: 700-credit AAPI + kiseki_* translations
+.
+├── ARCHITECTURE.md        # how the running system works
+├── docs/                  # project documentation
+├── notes/                 # research notes and design proposals
+├── kiseki.yaml            # complete, commented example config
+├── kiseki.service         # systemd unit
+└── packages/
+    ├── kiseki/            # main: HTTP server, auth, router, batch pipeline
+    ├── upstream-core/     # the engine: adapter contract, ApikeyPool, buckets
+    ├── upstream-generic/  # config-driven fallback provider
+    ├── upstream-alchemy/  # thin provider: CU table + error signatures
+    └── upstream-ankr/     # thin provider: 700-credit AAPI + kiseki_* translations
 ```
 
 ## Docs
 
-- [docs/design.md](docs/design.md) — the full architecture design: goals,
-  frozen decisions, routing, quota model, error policy, config schema, and the
-  reasoning behind every tradeoff.
-- [docs/implementation.md](docs/implementation.md) — the concrete code plan:
-  contracts, algorithms, milestones, and the test plan.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — how the running system works: two-level
+  routing, the quota and cost model, error handling, configuration, invariants,
+  design decisions, and known limitations. *(Indonesian)*
 - [docs/upstream-package-guide.md](docs/upstream-package-guide.md) — how to
-  write a new upstream package and wire it into Kiseki.
+  write a new upstream package and wire it into Kiseki. *(Indonesian)*
+- [notes/](notes/) — research notes on real provider behavior, and design
+  proposals (proposed, implemented, rejected). *(Indonesian)*
 
 ## Status
 
-v1.3 design, implemented and tested. Self-use oriented: single process,
-in-memory state, no multi-tenancy, no WebSocket yet — the roadmap for those
-lives at the end of the design doc.
+Implemented and tested. Self-use oriented: single process, in-memory state, no
+multi-tenancy, no WebSocket yet. Known limitations and the parts that are not
+wired up yet are listed at the end of [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## License
 
