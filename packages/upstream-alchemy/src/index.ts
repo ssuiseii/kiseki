@@ -135,10 +135,13 @@ export const ALCHEMY_CU: CostTable = {
  * Facts from `notes/research-notes/alchemy-provider.md` (§3, §5, §6):
  *
  *  - Alchemy rejects methods it cannot serve with code `-32600` — NOT `-32601`,
- *    so `isMethodNotFound` alone never catches them. Matching must go through
- *    the message content, not the code alone: `-32600` is also the code Alchemy
- *    uses for broken requests ("Must be authenticated!"), so a bare code check
- *    would swallow those as capability mismatches.
+ *    so `isMethodNotFound` alone never catches them. `-32600` does not prove the
+ *    method is unavailable: Alchemy uses it for several different failures, so
+ *    the matcher has to read the message content and cannot decide on the code
+ *    alone. A wrong apikey is one of those cases — it answers HTTP 401 with
+ *    `-32600` and "Must be authenticated!", but a 401 is classified as
+ *    `unauthorized` in upstream-core before any matcher runs, so that message
+ *    never reaches this function.
  *  - A rejection that proves the method does not exist on this instance
  *    ("Unsupported method: …", "… is not available on the <NETWORK>", the
  *    Free-tier "… is not available on the Free tier …") is a `method` mismatch
@@ -173,12 +176,12 @@ const UNSUPPORTED_METHOD_PATTERN =
 export const matchAlchemyCapability: CapabilityErrorMatcher = (error) => {
   if (isMethodNotFound(error)) return "method"
   const message = error.message.toLowerCase()
-  // Match on message content: -32600 is also used for broken requests, so the
-  // code alone proves nothing (see the block comment above).
+  // Match on message content: -32600 alone proves nothing about the method, so
+  // the code by itself is not enough (see the block comment above).
   if (error.code === -32600) {
     if (FREE_TIER_METHOD_PATTERN.test(message)) return "method"
     if (UNSUPPORTED_METHOD_PATTERN.test(message)) return "method"
-    // Not a method refusal → not mine (e.g. "Must be authenticated!").
+    // Not a method refusal → not mine.
     return null
   }
   // No Alchemy-specific archive signature beyond the generic ones; returning null
